@@ -1,0 +1,85 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment Variables and Credentials
+*.env
+*.env.*
+*.json
+!data/metadata/*.json
+!package.json
+!tsconfig.json
+!plugins.json
+!skills.json
+*.pem
+*.key
+*.p12
+*.crt
+
+# Data & Cache
+data/cache/*
+!data/cache/.gitkeep
+data/sample/*
+!data/sample/.gitkeep
+data/sample/README.md
+outputs/*
+!outputs/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# Real-NASA-DEM test fixture cache (downloaded locally by tests/fixtures/_download_real_dem.py,
+# not committed -- large binary raster data)
+tests/fixtures/nasa_real_dem_cache/
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing and Coverage
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Local scratch / non-project files accidentally dropped in repo root
+/*.pdf

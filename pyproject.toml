@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "terrain-analysis-agent"
+version = "0.1.0"
+description = "Terrain Analysis for Landing and Uncrewed Systems (TALUS) - Agentic AI lunar DEM analysis system"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "TALUS Research Team" }
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: GIS",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.2.0",
+    "numpy>=1.26.0",
+    "rasterio>=1.3.9",
+    "httpx>=0.27.0",
+    "google-genai>=0.1.1",
+    "streamlit>=1.32.0",
+    "plotly>=5.19.0",
+    "folium>=0.16.0",
+    "streamlit-folium>=0.18.0",
+    "scipy>=1.12.0",
+    "loguru>=0.7.2",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.23.0",
+    "black>=24.2.0",
+    "ruff>=0.3.0",
+    "mypy>=1.8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live_nasa: optional test that downloads a real NASA product. Skipped unless TALUS_RUN_LIVE_NASA=1.",
+    "real_dem: integration test against a real, locally cached NASA DEM fixture (see tests/fixtures/_download_real_dem.py). Self-skips if the fixture is absent; no network use.",
+]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
