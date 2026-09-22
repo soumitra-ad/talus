@@ -1,0 +1,4 @@
+# Streamlit Community Cloud dependency file (pip). Installs this project itself in editable
+# mode, which pulls in every dependency already declared in pyproject.toml -- kept as the
+# single source of truth so this file never drifts out of sync with it.
+-e .

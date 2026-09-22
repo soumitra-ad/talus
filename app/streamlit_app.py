@@ -46,6 +46,22 @@ from ui_helpers import (
 )
 
 # ---------------------------------------------------------------------------
+# Streamlit Community Cloud secrets -> environment
+#
+# Secrets pasted into Advanced settings are loaded into st.secrets; mirror root-level string
+# values into os.environ so the plain os.getenv() calls in terrain_agent.config (and the
+# TALUS_ACCESS_TOKEN check just below) see them exactly as they would a local .env file,
+# regardless of exactly when st.secrets itself is populated.
+# ---------------------------------------------------------------------------
+
+try:
+    for _key, _value in st.secrets.items():
+        if isinstance(_value, str) and _key not in os.environ:
+            os.environ[_key] = _value
+except Exception:
+    pass
+
+# ---------------------------------------------------------------------------
 # Page config — must be first Streamlit call
 # ---------------------------------------------------------------------------
 

@@ -130,7 +130,26 @@ For example, when evaluating maximum slope:
 
 ## Deployment
 
-For deploying TALUS to Google Cloud Run (container build, Secret Manager, dedicated
+### Streamlit Community Cloud (public URL, no infrastructure to manage)
+
+1. On [share.streamlit.io](https://share.streamlit.io), click **Create app** and pick this
+   GitHub repository.
+2. **Branch**: `main` (or whichever branch you want live). **Main file path**:
+   `app/streamlit_app.py`.
+3. Dependencies are read from the root [`requirements.txt`](requirements.txt) (which installs
+   this project, pulling in everything declared in `pyproject.toml`) — no extra setup needed.
+4. Under **Advanced settings → Secrets**, paste the keys you want from
+   [`.streamlit/secrets.toml.example`](.streamlit/secrets.toml.example) (TOML format). Every
+   key is optional; with none set, TALUS runs in offline deterministic demo mode. To enable
+   live Gemini chat and NASA DEM fetch on the public deployment, at minimum set:
+   ```toml
+   GEMINI_API_KEY = "..."
+   TALUS_NASA_DOWNLOADS = "true"
+   ```
+5. Click **Deploy**. Never commit a real `secrets.toml` — it's git-ignored, and secrets only
+   ever live in the Streamlit Cloud Secrets box.
+
+For deploying TALUS to Google Cloud Run instead (container build, Secret Manager, dedicated
 least-privilege service identity, resource limits, health checks, and a post-deploy smoke
 test), see [deploy/README.md](deploy/README.md).
 
