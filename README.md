@@ -128,6 +128,14 @@ For example, when evaluating maximum slope:
 
 ---
 
+## Deployment
+
+For deploying TALUS to Google Cloud Run (container build, Secret Manager, dedicated
+least-privilege service identity, resource limits, health checks, and a post-deploy smoke
+test), see [deploy/README.md](deploy/README.md).
+
+---
+
 ## Quickstart
 
 ### 1. Installation

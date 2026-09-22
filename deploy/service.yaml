@@ -1,0 +1,95 @@
+# Cloud Run (fully managed) service manifest for TALUS, in Knative Service form.
+#
+# Used via `gcloud run services replace` (not `gcloud run deploy`) because only the YAML path
+# lets us set startup/liveness probes -- `gcloud run deploy` flags cannot express those. This
+# is the single source of truth for the production service configuration; treat it like code.
+#
+# Placeholders (substituted by deploy/02_deploy.sh, never edited in place by hand):
+#   __IMAGE__              e.g. us-central1-docker.pkg.dev/my-project/talus/talus:abc1234
+#   __RUNTIME_SA_EMAIL__    the dedicated least-privilege runtime service account
+#
+# Secrets: GEMINI_API_KEY and TALUS_ACCESS_TOKEN are injected as environment variables FROM
+# Secret Manager at container start (valueFrom.secretKeyRef) -- their values are never present
+# in this file, in the image, in `gcloud run deploy` flags, or in shell history.
+#
+# GEMINI_API_KEY is optional: if you did not create that secret in deploy/00_setup_gcp.sh,
+# delete its `env` entry below before deploying, or the revision will fail to start.
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: talus
+  labels:
+    app: talus
+  annotations:
+    # Public by default at the Cloud Run ingress layer; access control is enforced by the
+    # app-level TALUS_ACCESS_TOKEN gate (see notes below) and/or the invoker IAM binding
+    # deploy/02_deploy.sh applies. Set to "internal-and-cloud-load-balancing" to also require
+    # a fronting HTTPS Load Balancer / Cloud Armor / IAP.
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        # Scale-to-zero: no cost when idle, matching a research/demo tool's usage pattern.
+        # Raise minScale to 1 if cold-start latency (~10-20s for this image) is unacceptable.
+        autoscaling.knative.dev/minScale: "0"
+        # Bounds the blast radius / cost of runaway autoscaling; raise deliberately, not by
+        # default.
+        autoscaling.knative.dev/maxScale: "3"
+    spec:
+      serviceAccountName: __RUNTIME_SA_EMAIL__
+      # Low per-instance concurrency: each active browser session can hold a raster window
+      # (up to MAX_ESTIMATED_MEMORY_MB per operation, see terrain/resource_safety.py) in
+      # memory. Keeping concurrency low avoids many simultaneous heavy operations exhausting
+      # one instance's memory budget; Cloud Run adds instances (up to maxScale) instead.
+      containerConcurrency: 4
+      # Generous enough to cover a synchronous NASA DEM download in the request path
+      # (TALUS_NASA_TOTAL_TIMEOUT_SEC default is 900s -- see requirement notes in README.md).
+      timeoutSeconds: 900
+      containers:
+        - image: __IMAGE__
+          ports:
+            - name: http1
+              containerPort: 8501
+          resources:
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          env:
+            - name: TALUS_ENV
+              value: "production"
+            - name: GEMINI_MODEL
+              value: "gemini-3.6-flash"
+            # Deliberate opt-in: NasaConfig.downloads_enabled defaults to OFF whenever
+            # TALUS_ENV=production (see src/terrain_agent/config/settings.py), so live NASA
+            # fetches must be explicitly re-enabled here. Set to "false" for a more
+            # conservative deployment that serves only bundled sample DEMs and whatever is
+            # already in the managed cache.
+            - name: TALUS_NASA_DOWNLOADS
+              value: "true"
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: GEMINI_API_KEY
+                  key: latest
+            - name: TALUS_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: TALUS_ACCESS_TOKEN
+                  key: latest
+          startupProbe:
+            httpGet:
+              path: /_stcore/health
+              port: 8501
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 6
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: 8501
+            periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 3

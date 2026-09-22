@@ -83,3 +83,6 @@ htmlcov/
 
 # Local scratch / non-project files accidentally dropped in repo root
 /*.pdf
+
+# Deployment script transient state (holds a built image tag, not a secret)
+deploy/.last_image
