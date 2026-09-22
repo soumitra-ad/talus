@@ -588,3 +588,54 @@ def test_dem_fetch_tab_reports_disabled_downloads_plainly(app, monkeypatch):
 
     assert not app.exception
     assert any("disabled" in getattr(w, "value", "").lower() for w in app.warning)
+
+
+def test_dem_fetch_tab_reports_success(app, monkeypatch):
+    fetch_result = {
+        "status": "ok",
+        "dem_path": "nasa/ldem_75s_240m-6d162ce24928.tif",
+        "from_cache": False,
+        "provenance": {
+            "mission": "LRO", "instrument": "LOLA",
+            "product_type": "GDRDEM", "product_id": "ldem_75s_240m",
+            "pixel_size_m": [240.0, 240.0], "width": 3812, "height": 3812,
+            "elevation_reference": "height above a reference sphere, not a geoid",
+        },
+        "disclaimer": DISCLAIMER,
+    }
+    _mock_dispatch(monkeypatch, {"fetch_nasa_dem": fetch_result})
+
+    app.run()
+    tab = app.tabs[5]  # NASA DEM Search
+    submit = next(b for b in tab.button if "Fetch DEM" in b.label)
+    submit.click().run()
+
+    assert not app.exception
+    assert any("DEM ready" in getattr(s, "value", "") for s in app.success)
+    assert any("ldem_75s_240m" in getattr(s, "value", "") for s in app.success)
+
+
+def test_dem_fetch_tab_reports_no_product_found_not_a_crash(app, monkeypatch):
+    """Regression test for the "ODE Products section has an unexpected structure" bug: a
+    query with zero matching NASA ODE products (e.g. SLDEM has no coverage at a given point)
+    must surface as a plain, clear result -- never an unhandled parser exception reaching the
+    Streamlit UI."""
+    _mock_dispatch(
+        monkeypatch,
+        {
+            "fetch_nasa_dem": {
+                "status": "no_product",
+                "error": "NASA ODE lists no supported DEM product for this area.",
+                "excluded_products": [],
+                "disclaimer": DISCLAIMER,
+            }
+        },
+    )
+
+    app.run()
+    tab = app.tabs[5]
+    submit = next(b for b in tab.button if "Fetch DEM" in b.label)
+    submit.click().run()
+
+    assert not app.exception
+    assert any("no nasa dem product" in getattr(w, "value", "").lower() for w in app.warning)

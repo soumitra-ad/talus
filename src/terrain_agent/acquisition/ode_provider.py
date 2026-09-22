@@ -97,6 +97,34 @@ def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else [value]
 
 
+#: Confirmed against the live ODE REST endpoint (oderest.rsl.wustl.edu/live2/): a query that
+#: matches zero products answers with this literal string in the "Products" slot, not a JSON
+#: null, an empty object, or an empty list. Matched case-insensitively since ODE's casing for
+#: this text is not documented and has not been observed to be stable.
+_NO_PRODUCTS_TEXT = "no products found"
+
+
+def _parse_products_field(products: Any) -> Optional[list[dict[str, Any]]]:
+    """Normalise the ``ODEResults.Products`` field to a list of product dicts.
+
+    Handles every shape observed from ODE or documented by its REST manual: absent/``null``
+    (no products), the ``"No Products Found"`` zero-match sentinel, a bare list of products
+    with no ``{"Product": ...}`` wrapper, and the usual wrapped dict (a single product object,
+    or a list of them, under ``"Product"``). Returns ``None`` only for a type/value this field
+    has never been observed to take, which the caller reports as a real structure error --
+    including any other, unrecognised string, which is not assumed to mean "zero results".
+    """
+    if products is None:
+        return []
+    if isinstance(products, str):
+        return [] if products.strip().lower() == _NO_PRODUCTS_TEXT else None
+    if isinstance(products, list):
+        return [p for p in products if isinstance(p, dict)]
+    if isinstance(products, dict):
+        return [p for p in _as_list(products.get("Product")) if isinstance(p, dict)]
+    return None
+
+
 MAX_REDIRECTS = 3
 _REDIRECT_STATUS = frozenset({301, 302, 307, 308})
 
@@ -273,6 +301,10 @@ class OdeProvider:
                     raise _RetryableError(f"HTTP {status}")
                 if status != 200:
                     raise ProviderUnavailableError(f"ODE answered with HTTP status {status}.")
+                log.info(
+                    "ODE HTTP response: status=%d, content_type=%s",
+                    status, response.headers.get("content-type", "?"),
+                )
                 encoding = response.headers.get("content-encoding", "identity").strip().lower()
                 if encoding not in ("", "identity"):
                     raise ProviderResponseError("ODE sent an encoded response that was not requested.")
@@ -290,6 +322,10 @@ class OdeProvider:
             raise ProviderResponseError("ODE did not return valid JSON.") from exc
         if not isinstance(payload, dict):
             raise ProviderResponseError("ODE returned an unexpected JSON structure.")
+        log.info(
+            "ODE response parsed: format=JSON, bytes=%d, top_level_keys=%s",
+            len(body), sorted(payload.keys()),
+        )
         return payload
 
     # ------------------------------------------------------------------
@@ -312,11 +348,19 @@ class OdeProvider:
     def _products(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         results = self._results(payload)
         products = results.get("Products")
-        if products is None:
-            return []
-        if not isinstance(products, dict):
-            raise ProviderResponseError("The ODE Products section has an unexpected structure.")
-        return [p for p in _as_list(products.get("Product")) if isinstance(p, dict)]
+        parsed = _parse_products_field(products)
+        if parsed is None:
+            raise ProviderResponseError(
+                "The ODE Products section has an unexpected structure "
+                f"(type={type(products).__name__})."
+            )
+        # Diagnostic only: no full response bodies, no secrets, just shape and identity.
+        first_keys = sorted(parsed[0].keys())[:12] if parsed else []
+        log.info(
+            "ODE Products section parsed: type=%s, product_count=%d, first_product_keys=%s",
+            type(products).__name__, len(parsed), first_keys,
+        )
+        return parsed
 
     @staticmethod
     def _identity(raw: dict[str, Any]) -> Optional[tuple[str, str, str, str]]:

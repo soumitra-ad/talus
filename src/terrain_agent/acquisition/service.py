@@ -138,6 +138,7 @@ class NasaDemService:
         self, request: CoverageRequest, types: Optional[tuple[str, ...]], refresh: bool
     ) -> AcquiredDem:
         candidates = self._provider.search(request, product_types=types)
+        log.info("NASA ODE search: candidate_count=%d", len(candidates))
         if not candidates:
             raise NoCoverageError("NASA ODE lists no supported DEM product for this area.")
         ranked, excluded = rank_for_request(candidates, request)
@@ -158,6 +159,10 @@ class NasaDemService:
         data = chosen.file(FileRole.DATA)
         label = chosen.file(FileRole.LABEL_PDS4)
         assert data is not None and label is not None
+        log.info(
+            "NASA DEM product selected: product_id=%s, data_url=%s, label_url=%s",
+            chosen.product_id, data.url, label.url,
+        )
         cache_id = make_cache_id(PROVIDER_ID, chosen.product_id, data.url)
 
         if not refresh:

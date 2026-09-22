@@ -469,6 +469,10 @@ class MockNasa:
         }
         if out:
             payload["ODEResults"]["Products"] = {"Product": out[0] if len(out) == 1 else out}
+        else:
+            # Matches the real ODE REST endpoint, confirmed live: a query with zero matches
+            # answers with this literal string, not an absent key, a null, or an empty list.
+            payload["ODEResults"]["Products"] = "No Products Found"
         return self._json(payload)
 
     @staticmethod

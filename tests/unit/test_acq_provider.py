@@ -160,8 +160,53 @@ def test_a_single_product_is_returned_as_an_object_not_a_list(mock_nasa):
 
 
 def test_no_products_gives_an_empty_list(mock_nasa):
+    # The mock's zero-match response mirrors the real ODE REST endpoint: "Products" holding
+    # the literal string "No Products Found", not an absent key, a null, or an empty list.
     provider, _ = make_provider(mock_nasa)
     assert provider.search(AREA, product_types=["GDRDEM"]) == []
+
+
+def test_the_real_ode_no_products_sentinel_is_recognised_directly(mock_nasa):
+    respond_with(
+        mock_nasa,
+        ode_json({"ODEResults": {"Status": "Success", "Products": "No Products Found"}}),
+    )
+    provider, _ = make_provider(mock_nasa)
+    assert provider.search(AREA, product_types=["GDRDEM"]) == []
+
+
+def test_the_no_products_sentinel_is_matched_case_insensitively(mock_nasa):
+    respond_with(
+        mock_nasa,
+        ode_json({"ODEResults": {"Status": "Success", "Products": "NO PRODUCTS FOUND"}}),
+    )
+    provider, _ = make_provider(mock_nasa)
+    assert provider.search(AREA, product_types=["GDRDEM"]) == []
+
+
+def test_a_bare_product_list_with_no_wrapper_object_is_accepted(mock_nasa):
+    good = add(mock_nasa)
+    respond_with(
+        mock_nasa,
+        ode_json({"ODEResults": {"Status": "Success", "Products": [good]}}),
+    )
+    provider, _ = make_provider(mock_nasa)
+    found = provider.search(AREA, product_types=["GDRDEM"])
+    assert [c.product_id for c in found] == ["ldem_75s_240m"]
+
+
+def test_an_unrecognised_string_in_products_is_still_a_structure_error(mock_nasa):
+    # Only the documented "No Products Found" sentinel means zero results; any other string
+    # is not assumed to mean the same thing and is still reported as a real parser failure
+    # (covered generally by test_malformed_responses_are_rejected; kept explicit here since
+    # it is the one case adjacent to the actual bug fix).
+    respond_with(
+        mock_nasa,
+        ode_json({"ODEResults": {"Status": "Success", "Products": "some other text"}}),
+    )
+    provider, _ = make_provider(mock_nasa)
+    with pytest.raises(ProviderResponseError):
+        provider.search(AREA, product_types=["GDRDEM"])
 
 
 def test_malformed_or_hostile_product_entries_are_skipped(mock_nasa):

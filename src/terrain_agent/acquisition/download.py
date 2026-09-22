@@ -184,6 +184,10 @@ class DownloadManager:
                     raise _RetryableError(f"HTTP {status}")
                 if status != 200:
                     raise DownloadError(f"The server answered with HTTP status {status}.")
+                log.info(
+                    "Download HTTP response: status=%d, content_type=%s",
+                    status, response.headers.get("content-type", "?"),
+                )
                 encoding = response.headers.get("content-encoding", "identity").strip().lower()
                 if encoding not in ("", "identity"):
                     raise DownloadError("The server sent an encoded body that was not requested.")

@@ -53,8 +53,12 @@ pytestmark = [
     ),
 ]
 
-# Shackleton crater region, lunar south pole.
-LAT, LON, RADIUS_M = -89.9, 0.0, 5000.0
+# Shackleton crater region, lunar south pole. These are the exact coordinates reported against
+# the deployed Streamlit "Fetch DEM" tool (radius given there in km): a real regression case for
+# the "ODE Products section has an unexpected structure" bug, which only reproduced with every
+# default product type queried (GDRDEM *and* SLDEM) -- SLDEM has zero coverage at this location,
+# and ODE represents that as the literal string "No Products Found", not an absent/null field.
+LAT, LON, RADIUS_M = -89.90, 0.16, 5.08 * 1000.0
 
 
 def test_real_nasa_lola_dem_end_to_end(tmp_path, capsys):
@@ -74,7 +78,9 @@ def test_real_nasa_lola_dem_end_to_end(tmp_path, capsys):
     # 1-3. Search, select, download, validate, normalise, cache.
     service = build_default_service(cache_dir=cache_dir)
     request = CoverageRequest.from_point(LAT, LON, RADIUS_M)
-    acquired = service.acquire(request, product_types=["GDRDEM"])
+    # product_types=None, exactly as the Streamlit "Fetch DEM" tool calls it with no
+    # preferred_dataset: every default type (GDRDEM and SLDEM) is queried.
+    acquired = service.acquire(request, product_types=None)
     p = acquired.provenance
 
     assert acquired.dem_path.is_file() and acquired.dem_path.parent == service.cache.root
