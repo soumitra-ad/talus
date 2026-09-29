@@ -8,9 +8,19 @@ from terrain_agent.agent.agent import (
     dispatch_tool_call,
     summarize_tool_call,
 )
+from terrain_agent.agent.nvidia import (
+    NvidiaAgentClient,
+    SessionSecret,
+    classify_nvidia_error,
+    validate_nvidia_key,
+)
 
 __all__ = [
     "TALUSAgent",
+    "NvidiaAgentClient",
+    "SessionSecret",
+    "classify_nvidia_error",
+    "validate_nvidia_key",
     "check_gemini_health",
     "dispatch_tool_call",
     "summarize_tool_call",

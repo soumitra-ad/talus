@@ -1,5 +1,5 @@
 """
-TALUS Gemini ADK Agent.
+TALUS conversational agent (NVIDIA hosted NIM by default; Gemini as an explicit opt-in).
 
 Orchestrates natural-language lunar terrain queries by routing them to
 deterministic Python tools. The LLM NEVER computes terrain values itself;
@@ -1234,6 +1234,9 @@ GEMINI_RETRY_STATUS_CODES = (408, 500, 502, 503, 504)
 #: of spending seconds on a call that is certain to fail again.
 GEMINI_COOLDOWN_S = {"quota_daily": 1800.0, "rate_limited": 60.0, "auth": 600.0, "model_not_found": 600.0}
 QUOTA_DAILY_MESSAGE = "Gemini daily quota reached. Terrain tools still available."
+#: NVIDIA cooldowns. An auth failure blocks until the user reconnects with a valid key (the app
+#: then builds a new agent), so its cooldown only matters for non-UI callers.
+NVIDIA_COOLDOWN_S = {"rate_limited": 60.0, "auth": 600.0, "model_not_found": 600.0}
 
 
 def _gemini_http_options(timeout_s: float = GEMINI_TIMEOUT_S, attempts: int = GEMINI_RETRY_ATTEMPTS) -> Any:
@@ -1350,11 +1353,17 @@ def _call_key(tool_name: str, tool_args: dict[str, Any]) -> str:
 
 class TALUSAgent:
     """
-    TALUS conversational agent backed by Google Gemini.
+    TALUS conversational agent.
 
-    When ``api_key`` is None (zero-credentials demo mode), the agent
-    falls back to a deterministic demo response that still executes
-    real terrain tools.
+    Providers:
+
+    * ``"nvidia"`` (default): NVIDIA hosted NIM through the OpenAI-compatible API. The agent
+      never reads a key itself; it is handed a per-session
+      ``terrain_agent.agent.nvidia.NvidiaAgentClient`` built from the key the user entered.
+    * ``"gemini"``: explicit opt-in (``LLM_PROVIDER=gemini``) using ``api_key`` / Vertex ADC.
+
+    Without a model client the agent runs in demo mode: questions about a named place still get
+    a deterministic NASA DEM analysis.
     """
 
     def __init__(
@@ -1369,6 +1378,7 @@ class TALUSAgent:
         max_requests_per_minute: int | None = None,
         temperature: float | None = None,
         client: Any | None = None,
+        provider: str | None = None,
     ) -> None:
         """
         Parameters
@@ -1382,11 +1392,31 @@ class TALUSAgent:
             Overrides for the configured agent-loop bounds and sampling temperature
             (``terrain_agent.config.settings``). Left as ``None`` to use the configured default.
         client:
-            Inject a pre-built client (for example ``terrain_agent.agent.mock_model.MockGeminiClient``)
-            instead of constructing a real ``google.genai.Client``. Used by tests to exercise the
-            full agentic loop deterministically, offline, and without credentials.
+            Inject a pre-built client: an ``NvidiaAgentClient`` for NVIDIA, or (for Gemini) for
+            example ``terrain_agent.agent.mock_model.MockGeminiClient`` instead of a real
+            ``google.genai.Client``. Tests use this to exercise the full agentic loop offline.
+        provider:
+            ``"nvidia"`` or ``"gemini"``. When omitted it is inferred: an ``NvidiaAgentClient``
+            means NVIDIA; any other injected client, ``api_key`` or Vertex project means Gemini
+            (the legacy constructor contract); otherwise the configured ``LLM_PROVIDER``.
         """
+        from terrain_agent.agent.nvidia import NvidiaAgentClient
         from terrain_agent.config import settings
+
+        if provider is None:
+            if isinstance(client, NvidiaAgentClient):
+                provider = "nvidia"
+            elif client is not None or api_key or vertex_project_id:
+                provider = "gemini"
+            else:
+                provider = settings.llm_provider
+        self.provider = provider if provider in ("nvidia", "gemini") else "nvidia"
+        if self.provider == "nvidia":
+            # The NVIDIA key lives only inside the injected per-session client, never here.
+            api_key = None
+            vertex_project_id = None
+            if isinstance(client, NvidiaAgentClient):
+                model_name = client.model
 
         self.api_key = api_key
         self.model_name = model_name
@@ -1395,15 +1425,37 @@ class TALUSAgent:
         self.vertex_location = vertex_location
         self.max_iterations = max_iterations or settings.agent.max_tool_iterations
         self.max_tool_calls_per_turn = settings.agent.max_tool_calls_per_turn
-        self.temperature = settings.model.temperature if temperature is None else temperature
+        if temperature is None:
+            temperature = settings.model.nvidia_temperature if self.provider == "nvidia" else settings.model.temperature
+        self.temperature = temperature
         self._rate_limiter = _RateLimiter(
             max_requests_per_minute or settings.agent.max_requests_per_minute
         )
         self._client: Any | None = client
         self._model_blocked: dict[str, Any] | None = None
 
-        if self._client is None and (api_key or vertex_project_id):
+        if self.provider == "gemini" and self._client is None and (api_key or vertex_project_id):
             self._init_client()
+
+    @property
+    def provider_label(self) -> str:
+        return "NVIDIA AI" if self.provider == "nvidia" else "Gemini"
+
+    def _classify_error(self, exc: BaseException) -> tuple[str, str]:
+        if self.provider == "nvidia":
+            from terrain_agent.agent.nvidia import classify_nvidia_error
+
+            return classify_nvidia_error(exc)
+        return classify_model_error(exc)
+
+    def close(self) -> None:
+        """Release the model client (for NVIDIA, this drops the session's key)."""
+        client, self._client = self._client, None
+        if client is not None and hasattr(client, "close"):
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                log.debug("Model client close failed")
 
     def _init_client(self) -> None:
         """Initialise the real Gemini client via the currently supported ``google-genai`` SDK."""
@@ -1514,10 +1566,12 @@ class TALUSAgent:
         if not self.is_live:
             # No model configured: still answer a question about a named place with the
             # deterministic NASA DEM pipeline, rather than only describing capabilities.
-            fallback = self._fallback(
-                user_message, max_slope_deg,
-                "Gemini is not configured (demo mode). Terrain tools still available.", emit,
+            notice = (
+                "NVIDIA AI is not connected (demo mode). Terrain tools still available."
+                if self.provider == "nvidia"
+                else "Gemini is not configured (demo mode). Terrain tools still available."
             )
+            fallback = self._fallback(user_message, max_slope_deg, notice, emit)
             if fallback["status"] == "fallback":
                 fallback["is_demo"] = True
                 return fallback
@@ -1539,27 +1593,28 @@ class TALUSAgent:
         # failure later in the turn and are still shown to the user.
         tool_calls_made: list[dict[str, Any]] = []
         try:
-            return self._gemini_response(
+            return self._model_response(
                 user_message, bounded_history, max_slope_deg, tool_calls_made, emit
             )
         except Exception as exc:  # noqa: BLE001 - the model/transport layer can fail in many ways
-            category, message = classify_model_error(exc)
+            # Fixed message only: SDK exception text can echo request/response details.
+            category, message = self._classify_error(exc)
             log.error(
                 "Agent turn failed: error_category=%s exception=%s tool_calls_completed=%d",
                 category, type(exc).__name__, len(tool_calls_made),
             )
-            cooldown = GEMINI_COOLDOWN_S.get(category)
+            cooldown = (NVIDIA_COOLDOWN_S if self.provider == "nvidia" else GEMINI_COOLDOWN_S).get(category)
             if cooldown:
                 self._model_blocked = {
                     "until": time.monotonic() + cooldown, "category": category, "message": message,
                 }
-            # Gemini failed: answer deterministically from NASA DEM data when the question
+            # The model failed: answer deterministically from NASA DEM data when the question
             # names a known place, instead of stopping at an error.
             fallback = self._fallback(user_message, max_slope_deg, message, emit)
             if fallback["status"] == "fallback":
                 fallback["error_category"] = category
                 return fallback
-            message = fallback["text"]  # the error plus what can still be done without Gemini
+            message = fallback["text"]  # the error plus what can still be done without the model
             if tool_calls_made:
                 message += (
                     " The deterministic tool results completed before the interruption are "
@@ -1573,7 +1628,41 @@ class TALUSAgent:
                 "is_demo": False,
             }
 
-    def _gemini_response(
+    def _open_session(self, history: list[dict[str, Any]]) -> Any:
+        """Start a provider-specific chat whose ``send_message`` returns an object with
+        ``function_calls`` (each with ``name``/``args``) and ``text``."""
+        if self.provider == "nvidia":
+            from terrain_agent.agent.nvidia import openai_tool_definitions
+
+            return self._client.start_chat(
+                system_prompt=TALUS_SYSTEM_PROMPT,
+                tools=openai_tool_definitions(TALUS_TOOL_DECLARATIONS),
+                history=history,
+                temperature=self.temperature,
+            )
+
+        config_kwargs: dict[str, Any] = {
+            "system_instruction": TALUS_SYSTEM_PROMPT,
+            "temperature": self.temperature,
+        }
+        if _genai_types is not None:
+            config_kwargs["tools"] = [_genai_types.Tool(function_declarations=TALUS_TOOL_DECLARATIONS)]
+            config = _genai_types.GenerateContentConfig(**config_kwargs)
+        else:  # pragma: no cover - only reachable with an injected mock client and no SDK
+            config = config_kwargs
+        return self._client.chats.create(model=self.model_name, config=config, history=history)
+
+    def _function_response_part(self, fn_call: Any, tool_name: str, result: dict[str, Any]) -> Any:
+        if self.provider == "nvidia":
+            from terrain_agent.agent.nvidia import ToolResultPart
+
+            return ToolResultPart(tool_call_id=getattr(fn_call, "id", ""), name=tool_name, result=result)
+        if _genai_types is not None:
+            return _genai_types.Part.from_function_response(name=tool_name, response={"result": result})
+        # pragma: no cover - only reachable with an injected mock client and no SDK
+        return {"function_response": {"name": tool_name, "response": {"result": result}}}
+
+    def _model_response(
         self,
         user_message: str,
         history: list[dict[str, Any]],
@@ -1589,19 +1678,7 @@ class TALUSAgent:
         """
         assert self._client is not None
 
-        config_kwargs: dict[str, Any] = {
-            "system_instruction": TALUS_SYSTEM_PROMPT,
-            "temperature": self.temperature,
-        }
-        if _genai_types is not None:
-            config_kwargs["tools"] = [_genai_types.Tool(function_declarations=TALUS_TOOL_DECLARATIONS)]
-            config = _genai_types.GenerateContentConfig(**config_kwargs)
-        else:  # pragma: no cover - only reachable with an injected mock client and no SDK
-            config = config_kwargs
-
-        chat_session = self._client.chats.create(
-            model=self.model_name, config=config, history=history
-        )
+        chat_session = self._open_session(history)
 
         # The prompt makes explicit, right next to the user's own words, that the session
         # context is trusted configuration while the user's text is a request to interpret,
@@ -1666,12 +1743,7 @@ class TALUSAgent:
                     }
                 )
 
-                if _genai_types is not None:
-                    response_parts.append(
-                        _genai_types.Part.from_function_response(name=tool_name, response={"result": result})
-                    )
-                else:  # pragma: no cover - only reachable with an injected mock client and no SDK
-                    response_parts.append({"function_response": {"name": tool_name, "response": {"result": result}}})
+                response_parts.append(self._function_response_part(fn_call, tool_name, result))
 
             if tool_call_cap_hit:
                 text = (
@@ -1703,7 +1775,7 @@ class TALUSAgent:
                 )
             else:
                 status = "model_error"
-                text = "Gemini returned an empty response. Please retry the analysis."
+                text = f"{self.provider_label} returned an empty response. Please retry the analysis."
 
         return {
             "status": status,
@@ -1711,6 +1783,9 @@ class TALUSAgent:
             "tool_calls": tool_calls_made,
             "is_demo": False,
         }
+
+    #: Backwards-compatible name for the provider-neutral loop.
+    _gemini_response = _model_response
 
     def _demo_response(
         self, user_message: str, max_slope_deg: float
@@ -1725,7 +1800,11 @@ class TALUSAgent:
             f"**TALUS Demo Mode** (no API key configured)\n\n"
             f"I received your question: *\"{user_message}\"*\n\n"
             f"To perform live lunar terrain analysis, you can:\n"
-            f"1. Set `GEMINI_API_KEY` in your environment for full AI-assisted analysis.\n"
+            + (
+                "1. Enter your NVIDIA API key in the NVIDIA AI Setup panel for full AI-assisted analysis.\n"
+                if self.provider == "nvidia"
+                else "1. Set `GEMINI_API_KEY` in your environment for full AI-assisted analysis.\n"
+            ) +
             f"2. Provide a local GeoTIFF DEM file path to run deterministic analysis directly.\n\n"
             f"**Active configuration:**\n"
             f"- Configured analysis threshold: `{max_slope_deg}°`\n"

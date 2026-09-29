@@ -12,14 +12,21 @@ structured ``status`` / ``overall_status`` enum fields on those results -- never
 response text (see ``ui_helpers.status_badge_html``).
 
 Layout (chat first, usable on small screens):
-- Header and a status bar (Gemini / NASA ODE / DEM engine)
+- Header and a status bar (NVIDIA NIM / NASA ODE / DEM engine)
+- NVIDIA AI Setup: each user enters their own NVIDIA API key (masked). It is validated with one
+  minimal request, kept only in this session's server-side state, and discarded on disconnect.
+  The AI agent stays disabled until the key is accepted
 - Agent conversation: each answer carries an observable activity trace, result cards built
   from structured tool output, and an evidence panel (dataset provenance, coordinates, method)
 - Direct Structured Analysis: forms that call the deterministic tools directly, no model
-- Sidebar: mission parameters, Gemini health check, conversation controls
+- Sidebar: mission parameters, system health, conversation controls
 
-No external service is contacted at startup: Gemini and NASA are only called when the user
-asks for something, so the UI loads even if either is unavailable.
+No AI service is contacted at startup: NVIDIA is first called when the user clicks "Connect
+NVIDIA AI", and NASA DEMs are only downloaded when the user asks for an analysis.
+
+Session isolation: the NVIDIA key, client, agent and conversation live only in
+``st.session_state`` (one per browser session). Nothing holding a key is module-level or in
+``st.cache_resource``, so one user's key can never be used by another session.
 
 Research/Demo Disclaimer
 ------------------------
@@ -48,6 +55,7 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ui_helpers import (
+    NVIDIA_PILL,
     STATE_EMOJI,
     TOOL_LABELS,
     analysis_outcome,
@@ -58,6 +66,7 @@ from ui_helpers import (
     friendly_error_message,
     list_managed_dems,
     nasa_status_from_tool_calls,
+    nvidia_pill,
     result_cards,
     sanitize_model_markdown,
     status_badge_html,
@@ -73,9 +82,12 @@ from ui_helpers import (
 # regardless of exactly when st.secrets itself is populated.
 # ---------------------------------------------------------------------------
 
+#: Never mirrored: an operator-provided NVIDIA key must not become a shared key for every user.
+_NEVER_MIRROR = frozenset({"NVIDIA_API_KEY"})
+
 try:
     for _key, _value in st.secrets.items():
-        if _key in os.environ:
+        if _key in os.environ or _key in _NEVER_MIRROR:
             continue
         # TOML booleans/numbers (TALUS_NASA_DOWNLOADS = true) are mirrored too; ignoring them
         # silently left NASA downloads disabled in production.
@@ -162,6 +174,11 @@ def _init_session() -> None:
         "nasa_status": "unknown",
         "gemini_health": None,
         "system_health": None,
+        # Per-session NVIDIA connection. The key itself is never stored under a plain name:
+        # it exists only inside this session's agent client (see _connect_pending_nvidia).
+        "nvidia_state": "not_connected",
+        "nvidia_error": None,
+        "agent": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -208,19 +225,90 @@ if not _check_access():
 
 
 # ---------------------------------------------------------------------------
-# Agent singleton and cached tool calls
+# Per-session AI agent (NVIDIA hosted NIM, user-entered key)
 # ---------------------------------------------------------------------------
 
+_KEY_INPUT = "nvidia_api_key_input"
+_PENDING = "_nvidia_pending_secret"
 
-@st.cache_resource
-def _build_agent(api_key: str | None, model_name: str) -> Any:
-    """Build and cache a TALUSAgent instance. Never logs or displays the API key itself."""
+
+def _on_connect_clicked() -> None:
+    """Form callback: move the typed key out of the widget into a redacted, session-only
+    holder and clear the widget, so the raw value does not linger in widget state."""
+    from terrain_agent.agent.nvidia import ERROR_MESSAGES, SessionSecret, normalize_key
+
+    raw = st.session_state.get(_KEY_INPUT, "")
+    st.session_state[_KEY_INPUT] = ""
+    key, problem = normalize_key(raw)
+    if problem:
+        st.session_state.nvidia_state = "not_connected"
+        st.session_state.nvidia_error = ERROR_MESSAGES[problem]
+        return
+    st.session_state[_PENDING] = SessionSecret(key)
+    st.session_state.nvidia_state = "connecting"
+    st.session_state.nvidia_error = None
+
+
+def _disconnect_nvidia() -> None:
+    """Drop this session's key, client and agent; the AI agent is disabled again."""
+    agent_obj = st.session_state.get("agent")
+    st.session_state.agent = None
+    if agent_obj is not None and hasattr(agent_obj, "close"):
+        try:
+            agent_obj.close()
+        except Exception:
+            log.warning("Closing the NVIDIA agent failed")
+    pending = st.session_state.pop(_PENDING, None)
+    if pending is not None:
+        pending.clear()
+    st.session_state.pop("nvidia_model", None)
+    st.session_state[_KEY_INPUT] = ""
+    st.session_state.nvidia_state = "not_connected"
+    st.session_state.nvidia_error = None
+    st.session_state.gemini_health = None
+    st.session_state.system_health = None
+
+
+def _connect_pending_nvidia(model: str) -> None:
+    """Validate the pending key with one minimal NVIDIA request and build this session's agent.
+    Runs only after the user clicked Connect; no NASA download or terrain analysis happens."""
+    import terrain_agent.agent as agent_pkg
+    from terrain_agent.agent import nvidia as nvidia_mod
+
+    secret = st.session_state.pop(_PENDING, None)
+    if secret is None:
+        st.session_state.nvidia_state = "not_connected"
+        return
     try:
-        from terrain_agent.agent import TALUSAgent
-        return TALUSAgent(api_key=api_key, model_name=model_name)
-    except Exception:
-        log.exception("Failed to initialise TALUSAgent")
-        return None
+        report, client = nvidia_mod.validate_nvidia_key(secret, model)
+    except Exception as exc:  # never show exception text: it may carry request details
+        category, message = nvidia_mod.classify_nvidia_error(exc)
+        log.warning("NVIDIA connect raised: error_category=%s exception=%s", category, type(exc).__name__)
+        report, client = nvidia_mod.ConnectionReport(False, category, message, model), None
+    finally:
+        secret.clear()
+    if report.ok and client is not None:
+        st.session_state.agent = agent_pkg.TALUSAgent(provider="nvidia", client=client, model_name=model)
+        st.session_state.nvidia_state = "connected"
+        st.session_state.nvidia_error = None
+        st.session_state.nvidia_model = model
+    else:
+        st.session_state.agent = None
+        st.session_state.nvidia_state = "auth_failed" if report.category == "auth" else (
+            "not_connected" if report.category in ("empty_key", "invalid_key_format") else "error"
+        )
+        st.session_state.nvidia_error = report.message
+
+
+def _gemini_session_agent(api_key: str | None, model_name: str) -> Any:
+    """LLM_PROVIDER=gemini (development opt-in): a per-session agent from the operator's key."""
+    if st.session_state.get("agent") is None:
+        try:
+            from terrain_agent.agent import TALUSAgent
+            st.session_state.agent = TALUSAgent(api_key=api_key, model_name=model_name, provider="gemini")
+        except Exception:
+            log.exception("Failed to initialise TALUSAgent")
+    return st.session_state.get("agent")
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -271,18 +359,33 @@ try:
     from terrain_agent.config import settings
     _APP_VERSION = settings.app_version
     _DEFAULT_SLOPE = settings.safety.default_max_slope_deg
-    _GEMINI_KEY = settings.model.api_key
+    _PROVIDER = settings.llm_provider
+    _NVIDIA_MODEL = settings.model.nvidia_model
     _MODEL_NAME = settings.model.model_name
     _NASA_DOWNLOADS = settings.nasa.downloads_enabled
 except Exception:
     log.exception("Failed to load configuration; using safe defaults")
     _APP_VERSION = "0.1.0"
     _DEFAULT_SLOPE = 15.0
-    _GEMINI_KEY = None
+    _PROVIDER = "nvidia"
+    _NVIDIA_MODEL = "nvidia/nemotron-3-super-120b-a12b"
     _MODEL_NAME = "gemini-3.6-flash"
     _NASA_DOWNLOADS = False
 
-agent = _build_agent(_GEMINI_KEY, _MODEL_NAME)
+_USE_NVIDIA = _PROVIDER == "nvidia"
+_AI_LABEL = "NVIDIA NIM" if _USE_NVIDIA else "Gemini"
+
+if _USE_NVIDIA:
+    if st.session_state.nvidia_state == "connecting":
+        with st.spinner("🟡 NVIDIA AI Connecting..."):
+            _connect_pending_nvidia(_NVIDIA_MODEL)
+    agent = st.session_state.agent if st.session_state.nvidia_state == "connected" else None
+else:
+    try:
+        _gemini_key = settings.model.api_key
+    except Exception:
+        _gemini_key = None
+    agent = _gemini_session_agent(_gemini_key, _MODEL_NAME)
 available_dems = _cached_managed_dems()
 
 
@@ -321,7 +424,21 @@ with st.sidebar:
 
     st.markdown("### 🤖 AI Status")
     _agent_block = agent.model_block if agent is not None and hasattr(agent, "model_block") else None
-    if _agent_block:
+    if _USE_NVIDIA:
+        _nv_state = st.session_state.nvidia_state
+        if _agent_block:
+            st.warning(_agent_block["message"])
+        elif _nv_state == "connected":
+            st.success(f"🟢 NVIDIA NIM Connected ({st.session_state.get('nvidia_model', _NVIDIA_MODEL)})")
+        elif _nv_state in ("auth_failed", "error"):
+            st.error(f"🔴 {NVIDIA_PILL[_nv_state][1]}")
+        else:
+            st.info("○ NVIDIA AI Not Connected — enter your NVIDIA API key in the setup panel. "
+                    "The Direct Structured Analysis tools work without it.")
+        if _nv_state == "connected":
+            st.button("Disconnect NVIDIA AI", key="disconnect_sidebar", width="stretch",
+                      on_click=_disconnect_nvidia)
+    elif _agent_block:
         st.warning(_agent_block["message"])
     elif agent is not None and getattr(agent, "is_live", False):
         st.success(f"Gemini Active ({_MODEL_NAME})")
@@ -329,14 +446,25 @@ with st.sidebar:
         st.info("Demo Mode — set GEMINI_API_KEY for live AI analysis. "
                 "Questions about a named place still get a deterministic NASA DEM analysis.")
 
+    def _ai_health_check() -> dict[str, Any] | None:
+        if not _USE_NVIDIA:
+            return None
+        from terrain_agent.health import check_nvidia
+        return check_nvidia(st.session_state.nvidia_state,
+                            model=st.session_state.get("nvidia_model", _NVIDIA_MODEL),
+                            observed_block=_agent_block)
+
     with st.expander("🩺 System health"):
         _health_checks = st.session_state.get("system_health")
         if st.button("Run full health check", width="stretch",
-                     help="Includes one live Gemini request (the free tier allows ~20 per day)."):
+                     help=("Reports this session's NVIDIA connection (no AI request is made), NASA "
+                           "ODE, internet and the DEM cache." if _USE_NVIDIA else
+                           "Includes one live Gemini request (the free tier allows ~20 per day).")):
             from terrain_agent.health import check_system_health, network_checks_enabled
-            with st.spinner("Checking Gemini, NASA ODE, internet and the DEM cache…"):
+            with st.spinner(f"Checking {_AI_LABEL}, NASA ODE, internet and the DEM cache…"):
                 _health_checks = check_system_health(
-                    network=network_checks_enabled(), gemini_live=True, observed_gemini_block=_agent_block,
+                    network=network_checks_enabled(), gemini_live=not _USE_NVIDIA,
+                    observed_gemini_block=_agent_block, ai_check=_ai_health_check(),
                 )
             st.session_state.system_health = _health_checks
             gemini_check = next((c for c in _health_checks if c["name"] == "Gemini API"), None)
@@ -347,7 +475,7 @@ with st.sidebar:
         if _health_checks is None:
             from terrain_agent.health import check_dem_cache, check_gemini, check_secrets
             _probe = _cached_network_health() or {}
-            _health_checks = [check_secrets(), check_gemini(observed_block=_agent_block)]
+            _health_checks = [check_secrets(), _ai_health_check() or check_gemini(observed_block=_agent_block)]
             _health_checks += [_probe[k] for k in ("nasa", "internet") if k in _probe]
             _health_checks += [check_dem_cache(), _cached_cache_writable()]
         for check in _health_checks:
@@ -377,6 +505,8 @@ st.markdown(
 )
 
 _states = status_bar_states(
+    ai_name=_AI_LABEL,
+    ai_state=nvidia_pill(st.session_state.nvidia_state, _agent_block) if _USE_NVIDIA else None,
     gemini_configured=agent is not None and getattr(agent, "is_live", False),
     gemini_block=_agent_block,
     gemini_health=st.session_state.gemini_health,
@@ -750,8 +880,8 @@ def _render_assistant_message(msg: dict[str, Any]) -> None:
         # Gemini was unavailable and this answer came from the deterministic pipeline.
         st.warning(f"{msg['notice']} This answer was produced by the deterministic NASA DEM tools only.")
     elif msg.get("is_demo"):
-        st.info("📡 Demo Mode — set GEMINI_API_KEY for live AI analysis, or use the Direct "
-                "Analysis tools below, which work without one.")
+        st.info("📡 Demo Mode — " + ("connect NVIDIA AI" if _USE_NVIDIA else "set GEMINI_API_KEY")
+                + " for live AI analysis, or use the Direct Analysis tools below, which work without one.")
     if status in ("invalid_request", "rate_limited", "model_error"):
         st.warning(msg.get("content", ""))
     else:
@@ -786,6 +916,37 @@ SUGGESTED = [
     "What DEM data is available for the lunar south pole?",
 ]
 
+def _render_nvidia_setup() -> None:
+    """First screen: the user's own NVIDIA key, entered masked, before the agent is enabled."""
+    st.markdown("### 🔐 NVIDIA AI Setup")
+    st.write("Enter your NVIDIA API key to activate the TALUS AI Agent.")
+    with st.form("nvidia_setup_form", clear_on_submit=True):
+        st.text_input("NVIDIA API Key", type="password", key=_KEY_INPUT,
+                      placeholder="nvapi-…", autocomplete="off")
+        st.form_submit_button("Connect NVIDIA AI", on_click=_on_connect_clicked)
+    state = st.session_state.nvidia_state
+    error = st.session_state.nvidia_error
+    if state == "auth_failed":
+        st.error("🔴 NVIDIA API authentication failed.\n\nPlease check your NVIDIA API key.")
+    elif error:
+        st.error(f"🔴 {error}")
+    st.markdown(f"**Status:** {STATE_EMOJI[NVIDIA_PILL[state][0]]} {NVIDIA_PILL[state][1]}")
+    st.caption(
+        "Your key is kept only in this browser session's server memory and is sent only to "
+        "NVIDIA's hosted API (integrate.api.nvidia.com). It is never saved, logged or shown, "
+        "and it is discarded when you disconnect or close the session. The Direct Structured "
+        "Analysis tools below work without a key."
+    )
+
+
+_ai_ready = agent is not None or not _USE_NVIDIA
+if _USE_NVIDIA and not _ai_ready:
+    _render_nvidia_setup()
+elif _USE_NVIDIA:
+    _c1, _c2 = st.columns([3, 1])
+    _c1.success(f"🟢 NVIDIA NIM Connected · AI Agent Ready ({st.session_state.get('nvidia_model', _NVIDIA_MODEL)})")
+    _c2.button("Disconnect NVIDIA AI", key="disconnect_main", width="stretch", on_click=_disconnect_nvidia)
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"], avatar="🧑‍🚀" if msg["role"] == "user" else "🌕"):
         if msg["role"] == "user":
@@ -793,7 +954,7 @@ for msg in st.session_state.messages:
         else:
             _render_assistant_message(msg)
 
-if not st.session_state.messages:
+if _ai_ready and not st.session_state.messages:
     st.caption("Try one of these, or ask your own terrain question:")
     pill_cols = st.columns(2)
     for idx, q in enumerate(SUGGESTED):
@@ -803,8 +964,14 @@ if not st.session_state.messages:
 # Inside a container the chat input renders inline, right under the conversation, instead of
 # being pinned over the Direct Analysis section below it.
 with st.container():
-    typed = st.chat_input("Ask TALUS about lunar terrain, e.g. elevation around Shackleton Crater")
-query = (typed or st.session_state.pop("_pending_query", "") or "").strip()
+    typed = st.chat_input(
+        "Ask TALUS about lunar terrain, e.g. elevation around Shackleton Crater"
+        if _ai_ready else "Connect NVIDIA AI above to enable the TALUS AI Agent",
+        disabled=not _ai_ready,
+    )
+query = (typed or st.session_state.pop("_pending_query", "") or "").strip() if _ai_ready else ""
+if not _ai_ready:
+    st.session_state.pop("_pending_query", None)
 
 if query:
     history = _history_for_agent()
@@ -834,7 +1001,7 @@ if query:
             if failed:
                 label = "Analysis could not be completed"
             elif result.get("status") == "fallback":
-                label = "Analysis complete (deterministic mode — Gemini unavailable)"
+                label = f"Analysis complete (deterministic mode — {_AI_LABEL} unavailable)"
             else:
                 label = "Analysis complete"
             activity.update(label=label, state="error" if failed else "complete", expanded=False)
@@ -855,6 +1022,10 @@ if query:
         st.session_state.nasa_status = new_nasa
     if _latest(tool_calls, "fetch_nasa_dem"):
         _cached_managed_dems.clear()
+    if _USE_NVIDIA and result.get("error_category") == "auth":
+        # The key stopped working mid-session (e.g. revoked): drop it and ask again.
+        _disconnect_nvidia()
+        st.session_state.nvidia_state = "auth_failed"
     st.rerun()
 
 

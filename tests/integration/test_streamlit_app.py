@@ -64,6 +64,29 @@ def _mock_managed_dems(monkeypatch, names: list[str]) -> None:
 DISCLAIMER = "TALUS is a research and demonstration system. Not certified for flight safety."
 
 
+TEST_NVIDIA_KEY = "nvapi-TEST-ONLY-not-a-real-key-0123456789"
+
+
+def _connect(app: AppTest, monkeypatch, key: str = TEST_NVIDIA_KEY) -> AppTest:
+    """Run the app and connect NVIDIA AI through the real setup form, with the network check
+    replaced by a stub that accepts the key (no NVIDIA request is made)."""
+    from terrain_agent.agent import nvidia as nvidia_mod
+
+    def fake_validate(secret, model, **_):
+        assert isinstance(secret, nvidia_mod.SessionSecret) and secret.reveal() == key
+        return (
+            nvidia_mod.ConnectionReport(True, None, "NVIDIA NIM Connected", model, True, True, 0.1),
+            nvidia_mod.NvidiaAgentClient(client=None, model=model),
+        )
+
+    monkeypatch.setattr(nvidia_mod, "validate_nvidia_key", fake_validate)
+    app.run()
+    next(w for w in app.text_input if w.label == "NVIDIA API Key").set_value(key)
+    next(b for b in app.button if b.label == "Connect NVIDIA AI").click().run()
+    assert app.session_state["nvidia_state"] == "connected"
+    return app
+
+
 # ---------------------------------------------------------------------------
 # 1. Basic load / layout
 # ---------------------------------------------------------------------------
@@ -439,7 +462,7 @@ def test_chat_round_trip_with_a_mocked_agent(app, monkeypatch):
     )
     monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: fake)
 
-    app.run()
+    _connect(app, monkeypatch)
     app.chat_input[0].set_value("what is the slope near the south pole?").run()
 
     assert not app.exception
@@ -458,7 +481,7 @@ def test_chat_message_content_is_html_escaped_not_rendered_as_markup(app, monkey
     fake = _FakeAgent(f"Product description says: {payload}")
     monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: fake)
 
-    app.run()
+    _connect(app, monkeypatch)
     app.chat_input[0].set_value(payload).run()
 
     assert not app.exception
@@ -477,7 +500,7 @@ def test_chat_demo_mode_banner_shown_when_no_live_model(app, monkeypatch):
     fake.is_live = False
     monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: fake)
 
-    app.run()
+    _connect(app, monkeypatch)
     app.chat_input[0].set_value("hello").run()
 
     assert not app.exception
@@ -497,7 +520,7 @@ def test_chat_rejects_are_shown_as_a_warning_not_a_crash(app, monkeypatch):
 
     monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: _RejectingAgent())
 
-    app.run()
+    _connect(app, monkeypatch)
     app.chat_input[0].set_value("go go go").run()
 
     assert not app.exception
@@ -681,7 +704,7 @@ def test_shackleton_answer_renders_result_cards_evidence_and_nasa_status(app, mo
     fake = _RecordingAgent("Based on the retrieved LOLA DEM, the mean elevation is -185.54 m. Research/demo, not certified.", tool_calls=_shackleton_tool_calls())
     monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: fake)
 
-    app.run()
+    _connect(app, monkeypatch)
     # Offline suite: the network probe is off, so NASA is not claimed healthy before any contact.
     assert any("NASA: 🟡" in m.value for m in app.markdown)
     app.chat_input[0].set_value("What is the average elevation around Shackleton Crater?").run()
@@ -705,7 +728,7 @@ def test_follow_up_history_uses_gemini_roles_and_reruns_do_not_repeat_calls(app,
     fake = _RecordingAgent("Answer. Research/demo, not certified.")
     monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: fake)
 
-    app.run()
+    _connect(app, monkeypatch)
     app.chat_input[0].set_value("first question").run()
     app.run()  # a plain rerun (e.g. a widget change) must not call the agent again
     assert len(fake.calls) == 1
@@ -724,7 +747,7 @@ def test_suggested_prompt_button_runs_the_query_once(app, monkeypatch):
     fake = _RecordingAgent("Answer. Research/demo, not certified.")
     monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: fake)
 
-    app.run()
+    _connect(app, monkeypatch)
     next(b for b in app.button if "Shackleton" in b.label).click().run()
 
     assert not app.exception
@@ -740,7 +763,7 @@ def test_model_error_keeps_deterministic_results_visible(app, monkeypatch):
 
     monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: _Failing(""))
 
-    app.run()
+    _connect(app, monkeypatch)
     app.chat_input[0].set_value("elevation around Shackleton?").run()
 
     assert not app.exception
@@ -768,7 +791,7 @@ def test_quota_fallback_answer_shows_the_notice_and_deterministic_cards(app, mon
 
     monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: _FallbackAgent(""))
 
-    app.run()
+    _connect(app, monkeypatch)
     app.chat_input[0].set_value("What is the average elevation around Shackleton Crater?").run()
 
     assert not app.exception
@@ -831,5 +854,5 @@ def test_header_and_status_bar_render_without_network_access(app):
     assert not app.exception
     page = " ".join(m.value for m in app.markdown)
     assert "TALUS AI" in page and "Lunar Terrain Intelligence Agent" in page
-    for label in ("Gemini:", "NASA:", "DEM Cache:"):
+    for label in ("NVIDIA NIM:", "NASA:", "DEM Cache:"):
         assert label in page

@@ -133,8 +133,40 @@ class AgentLimitsConfig(BaseModel):
     )
 
 
+#: Default NVIDIA hosted model: listed on integrate.api.nvidia.com/v1/models and documented by
+#: NVIDIA for agentic tool calling. Override with NVIDIA_MODEL; the connect step verifies it.
+DEFAULT_NVIDIA_MODEL = "nvidia/nemotron-3-super-120b-a12b"
+
+
 class ModelConfig(BaseModel):
-    """Google Gemini & AI orchestration settings."""
+    """LLM provider settings.
+
+    ``provider`` defaults to ``nvidia`` (NVIDIA hosted NIM). There is intentionally no setting
+    for an NVIDIA API key: each user enters their own key in the app, and it lives only in
+    that user's session. Gemini remains available as an explicit opt-in
+    (``LLM_PROVIDER=gemini``) for development.
+    """
+    provider: str = Field(
+        default_factory=lambda: os.getenv("LLM_PROVIDER", "nvidia").strip().lower() or "nvidia",
+        description="Active LLM provider: 'nvidia' (default) or 'gemini'.",
+    )
+    nvidia_model: str = Field(
+        default_factory=lambda: os.getenv("NVIDIA_MODEL", DEFAULT_NVIDIA_MODEL).strip() or DEFAULT_NVIDIA_MODEL,
+        description="NVIDIA hosted model id, verified against the model listing on connect.",
+    )
+    nvidia_temperature: float = Field(
+        default_factory=lambda: float(os.getenv("NVIDIA_TEMPERATURE", "0.6")),
+        description="Sampling temperature for NVIDIA tool-calling turns (NVIDIA's recommended "
+        "value for Nemotron tool use).",
+        ge=0.0,
+        le=1.0,
+    )
+    nvidia_max_tokens: int = Field(
+        default_factory=lambda: int(os.getenv("NVIDIA_MAX_TOKENS", "4096")),
+        description="Maximum completion tokens per NVIDIA request (reasoning included).",
+        ge=64,
+        le=32768,
+    )
     model_name: str = Field(
         default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
         description="Configurable LLM model identifier",
@@ -241,6 +273,11 @@ class TerrainSettings(BaseModel):
         "wac.lroc.asu.edu",
         "lroc.sese.asu.edu",
     }
+
+    @property
+    def llm_provider(self) -> str:
+        """The configured provider, falling back to 'nvidia' for unknown values."""
+        return self.model.provider if self.model.provider in ("nvidia", "gemini") else "nvidia"
 
     @property
     def is_gemini_available(self) -> bool:

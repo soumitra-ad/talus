@@ -242,26 +242,51 @@ def result_cards(tool_calls: list[dict[str, Any]]) -> list[dict[str, str]] | Non
     return [elevation, slope, dataset, safety]
 
 
-STATE_EMOJI = {"ok": "🟢", "warn": "🟡", "fail": "🔴"}
+STATE_EMOJI = {"ok": "🟢", "warn": "🟡", "fail": "🔴", "off": "○"}
+
+#: Per-session NVIDIA connection state -> (status-bar state, label). Never includes key material.
+NVIDIA_PILL = {
+    "not_connected": ("off", "NVIDIA AI Not Connected"),
+    "connecting": ("warn", "NVIDIA AI Connecting..."),
+    "connected": ("ok", "NVIDIA NIM Connected"),
+    "auth_failed": ("fail", "NVIDIA NIM Authentication Failed"),
+    "error": ("fail", "NVIDIA NIM Unavailable"),
+}
+
+
+def nvidia_pill(connection: str, block: dict[str, Any] | None = None) -> tuple[str, str]:
+    """Status-bar pill for this session's NVIDIA connection."""
+    if connection == "connected" and block:
+        if block.get("category") == "auth":
+            return NVIDIA_PILL["auth_failed"]
+        return ("fail", "Rate limited" if block.get("category") == "rate_limited" else "Unavailable")
+    return NVIDIA_PILL.get(connection, NVIDIA_PILL["not_connected"])
 
 
 def status_bar_states(
     *,
-    gemini_configured: bool,
-    gemini_block: dict[str, Any] | None,
-    gemini_health: dict[str, Any] | None,
+    gemini_configured: bool = False,
+    gemini_block: dict[str, Any] | None = None,
+    gemini_health: dict[str, Any] | None = None,
     nasa_observed: str,
     nasa_probe: dict[str, Any] | None,
     downloads_enabled: bool,
     dem_count: int,
     cache_writable: bool,
+    ai_name: str = "Gemini",
+    ai_state: tuple[str, str] | None = None,
 ) -> dict[str, tuple[str, str]]:
-    """``{"Gemini" | "NASA" | "DEM Cache": (state, text)}`` with state ok / warn / fail.
+    """``{ai_name | "NASA" | "DEM Cache": (state, text)}`` with state ok / warn / fail / off.
+
+    ``ai_state`` supplies the AI provider pill directly (the NVIDIA session connection, see
+    ``nvidia_pill``); otherwise it is derived from the legacy Gemini arguments.
 
     What the app actually observed this session (a failed call, a quota block, a live
     NASA fetch) takes precedence over the periodic probe, which can be up to ten minutes old.
     """
-    if gemini_block:
+    if ai_state is not None:
+        gemini = ai_state
+    elif gemini_block:
         gemini = ("fail", "Daily quota reached" if gemini_block.get("category") == "quota_daily" else "Unavailable")
     elif not gemini_configured:
         gemini = ("warn", "Not configured")
@@ -287,7 +312,7 @@ def status_bar_states(
         cache = ("ok", f"{dem_count} cached")
     else:
         cache = ("warn", "Empty · auto-download")
-    return {"Gemini": gemini, "NASA": nasa, "DEM Cache": cache}
+    return {ai_name: gemini, "NASA": nasa, "DEM Cache": cache}
 
 
 _MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")

@@ -272,3 +272,15 @@ def test_status_bar_states():
 
 def test_fallback_counts_as_a_completed_analysis():
     assert _uh.analysis_outcome("fallback", [_tc("get_elevation_stats", "ok")]) == "Completed"
+
+def test_nvidia_status_pill_states():
+    assert _uh.nvidia_pill("not_connected") == ("off", "NVIDIA AI Not Connected")
+    assert _uh.nvidia_pill("connecting") == ("warn", "NVIDIA AI Connecting...")
+    assert _uh.nvidia_pill("connected") == ("ok", "NVIDIA NIM Connected")
+    assert _uh.nvidia_pill("auth_failed") == ("fail", "NVIDIA NIM Authentication Failed")
+    assert _uh.nvidia_pill("connected", {"category": "auth"}) == ("fail", "NVIDIA NIM Authentication Failed")
+    assert _uh.nvidia_pill("connected", {"category": "rate_limited"})[0] == "fail"
+    assert _uh.STATE_EMOJI["off"] == "○"
+    states = _uh.status_bar_states(ai_name="NVIDIA NIM", ai_state=_uh.nvidia_pill("connected"), nasa_observed="unknown",
+                                   nasa_probe=None, downloads_enabled=True, dem_count=1, cache_writable=True)
+    assert states["NVIDIA NIM"] == ("ok", "NVIDIA NIM Connected") and "Gemini" not in states

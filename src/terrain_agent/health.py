@@ -4,8 +4,9 @@
 ``fail`` with a short, safe detail string:
 
 * required secrets / configuration (names only, never values)
-* Gemini API (configuration and last observed state; a live request only when asked, because
-  the Gemini free tier allows very few requests per day)
+* the AI provider: NVIDIA NIM by default, reported from this session's connection state (the
+  NVIDIA key is entered per session in the app, never read from configuration); or Gemini when
+  ``LLM_PROVIDER=gemini`` (a live request only when asked)
 * NASA ODE search API reachability
 * internet access to the NASA download host
 * DEM cache contents
@@ -59,7 +60,8 @@ def check_secrets() -> dict[str, Any]:
 
     missing: list[str] = []
     notes: list[str] = []
-    if not settings.model.api_key and not settings.model.vertex_project_id:
+    provider = settings.llm_provider
+    if provider == "gemini" and not settings.model.api_key and not settings.model.vertex_project_id:
         missing.append("GEMINI_API_KEY")
     if not settings.nasa.downloads_enabled:
         notes.append(
@@ -70,7 +72,40 @@ def check_secrets() -> dict[str, Any]:
         parts = [f"Missing: {', '.join(missing)} (chat runs in deterministic mode)"] if missing else []
         parts += [f"{n}: NASA DEMs cannot be downloaded" for n in notes]
         return _check("Required secrets", WARN, "; ".join(parts), missing=missing)
+    if provider == "nvidia":
+        return _check(
+            "Required secrets", OK,
+            "No AI secret is required: each user enters their own NVIDIA API key in the app. "
+            "NASA download settings are present.",
+            missing=[],
+        )
     return _check("Required secrets", OK, "GEMINI_API_KEY and NASA download settings are present.", missing=[])
+
+
+#: Connection states of the per-session NVIDIA link, as shown in the UI.
+NVIDIA_STATES = {
+    "not_connected": (WARN, "NVIDIA AI Not Connected. Enter your NVIDIA API key to enable the AI agent. Terrain tools still work."),
+    "connecting": (WARN, "NVIDIA AI Connecting..."),
+    "connected": (OK, "NVIDIA NIM Connected"),
+    "auth_failed": (FAIL, "NVIDIA NIM Authentication Failed"),
+    "error": (FAIL, "NVIDIA NIM connection failed"),
+}
+
+
+def check_nvidia(
+    state: str = "not_connected",
+    *,
+    model: Optional[str] = None,
+    observed_block: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Report this session's NVIDIA connection. Makes no request and holds no key."""
+    if state == "connected" and observed_block:
+        return _check("NVIDIA NIM", FAIL, observed_block.get("message") or "Temporarily unavailable.",
+                      category=observed_block.get("category"))
+    level, detail = NVIDIA_STATES.get(state, NVIDIA_STATES["not_connected"])
+    if state == "connected" and model:
+        detail = f"{detail} ({model})"
+    return _check("NVIDIA NIM", level, detail, connection=state)
 
 
 def check_gemini(*, live: bool = False, observed_block: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -178,13 +213,21 @@ def check_system_health(
     network: bool = True,
     gemini_live: bool = False,
     observed_gemini_block: Optional[dict[str, Any]] = None,
+    ai_check: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, Any]]:
     """Run every check. ``network=False`` skips the NASA/internet probes (e.g. offline tests);
-    ``gemini_live=True`` spends one Gemini request on a live check."""
-    checks = [
-        check_secrets,
-        lambda: check_gemini(live=gemini_live, observed_block=observed_gemini_block),
-    ]
+    ``gemini_live=True`` spends one Gemini request on a live check (Gemini provider only).
+    ``ai_check`` is the caller's already-computed AI provider check (the app passes this
+    session's NVIDIA state); without it the NVIDIA provider is reported as not connected."""
+    from terrain_agent.config import settings
+
+    if ai_check is not None:
+        ai = lambda: ai_check  # noqa: E731
+    elif settings.llm_provider == "nvidia":
+        ai = check_nvidia
+    else:
+        ai = lambda: check_gemini(live=gemini_live, observed_block=observed_gemini_block)  # noqa: E731
+    checks = [check_secrets, ai]
     if network:
         checks += [check_nasa_ode, check_internet]
     checks += [check_dem_cache, check_cache_writable]
@@ -205,5 +248,5 @@ def network_checks_enabled() -> bool:
 __all__ = [
     "FAIL", "OK", "WARN",
     "check_cache_writable", "check_dem_cache", "check_gemini", "check_internet",
-    "check_nasa_ode", "check_secrets", "check_system_health", "network_checks_enabled",
+    "check_nasa_ode", "check_nvidia", "check_secrets", "check_system_health", "network_checks_enabled",
 ]

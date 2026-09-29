@@ -191,7 +191,10 @@ def test_demo_mode_still_answers_a_named_place_deterministically(wired):
     assert not agent.is_live
     result = agent.chat("What is the average elevation around Shackleton Crater?")
     assert result["status"] == "fallback" and result["is_demo"] is True
-    assert "not configured" in result["notice"]
+    # NVIDIA is the default provider: the notice says it is not connected.
+    assert "NVIDIA AI is not connected" in result["notice"]
+    gemini = TALUSAgent(api_key=None, dem_cache_dir=wired, provider="gemini")
+    assert "not configured" in gemini.chat("What is the average elevation around Shackleton Crater?")["notice"]
 
 
 def test_demo_mode_without_a_place_keeps_the_capabilities_message(tmp_path):
@@ -212,6 +215,7 @@ def test_a_working_model_is_unaffected_by_the_fallback(tmp_path):
 def test_secrets_check_reports_names_never_values(monkeypatch):
     from terrain_agent.config.settings import settings
 
+    monkeypatch.setattr(settings.model, "provider", "gemini")
     monkeypatch.setattr(settings.model, "api_key", None)
     monkeypatch.setattr(settings.model, "vertex_project_id", None)
     monkeypatch.setattr(settings.nasa, "downloads_enabled", False)
@@ -318,3 +322,38 @@ def test_network_check_switch(monkeypatch):
     assert health.network_checks_enabled() is False
     monkeypatch.setenv("TALUS_HEALTH_NETWORK_CHECK", "true")
     assert health.network_checks_enabled() is True
+
+
+def test_secrets_check_with_nvidia_requires_no_ai_secret(monkeypatch):
+    """NVIDIA mode: the key is entered per session in the UI, so no AI secret is required."""
+    from terrain_agent.config.settings import settings
+
+    monkeypatch.setattr(settings.model, "provider", "nvidia")
+    monkeypatch.setattr(settings.model, "api_key", None)
+    monkeypatch.setattr(settings.model, "vertex_project_id", None)
+    monkeypatch.setattr(settings.nasa, "downloads_enabled", True)
+    monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-ENV-KEY-MUST-NOT-BE-USED")
+    result = health.check_secrets()
+    assert result["state"] == "ok" and result["missing"] == []
+    assert "GEMINI_API_KEY" not in result["detail"] and "nvapi-ENV" not in str(result)
+
+
+def test_nvidia_health_check_states_make_no_request():
+    assert health.check_nvidia()["state"] == "warn"
+    assert "Not Connected" in health.check_nvidia("not_connected")["detail"]
+    assert health.check_nvidia("connecting")["detail"] == "NVIDIA AI Connecting..."
+    ok = health.check_nvidia("connected", model="nvidia/some-model")
+    assert ok["state"] == "ok" and ok["detail"] == "NVIDIA NIM Connected (nvidia/some-model)"
+    assert health.check_nvidia("auth_failed")["detail"] == "NVIDIA NIM Authentication Failed"
+    blocked = health.check_nvidia("connected", observed_block={"category": "rate_limited", "message": "limit"})
+    assert blocked["state"] == "fail" and blocked["detail"] == "limit"
+
+
+def test_system_health_reports_nvidia_by_default(monkeypatch):
+    from terrain_agent.config.settings import settings
+
+    monkeypatch.setattr(settings.model, "provider", "nvidia")
+    names = [r["name"] for r in health.check_system_health(network=False)]
+    assert "NVIDIA NIM" in names and "Gemini API" not in names
+    custom = health.check_nvidia("connected", model="m")
+    assert custom in health.check_system_health(network=False, ai_check=custom)

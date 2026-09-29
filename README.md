@@ -140,11 +140,12 @@ For example, when evaluating maximum slope:
    this project, pulling in everything declared in `pyproject.toml`) — no extra setup needed,
    and no `packages.txt` (rasterio's wheels bundle GDAL).
 4. Under **Advanced settings → Secrets**, paste the keys you want from
-   [`.streamlit/secrets.toml.example`](.streamlit/secrets.toml.example) (TOML format). Every
-   key is optional; with none set, TALUS runs in offline deterministic demo mode. To enable
-   live Gemini chat and NASA DEM fetch on the public deployment, at minimum set:
+   [`.streamlit/secrets.toml.example`](.streamlit/secrets.toml.example) (TOML format). **No AI
+   API key goes in Secrets**: each visitor enters their own NVIDIA API key in the app's
+   *NVIDIA AI Setup* panel. For NASA DEM fetch on the public deployment, set:
    ```toml
-   GEMINI_API_KEY = "..."
+   LLM_PROVIDER = "nvidia"
+   TALUS_ENV = "production"
    TALUS_NASA_DOWNLOADS = "true"
    ```
 5. Click **Deploy**. Never commit a real `secrets.toml` — it's git-ignored, and secrets only
@@ -182,11 +183,21 @@ pip install -e .
 streamlit run app/streamlit_app.py
 ```
 
-### 3. Optional Google AI / Vertex AI Configuration
+### 3. Connect the AI agent (NVIDIA hosted NIM)
 
-To enable Gemini-powered natural-language reasoning, set the environment variable:
-```bash
-export GEMINI_API_KEY="your-api-key"
-# or configure Google Cloud Application Default Credentials (ADC) for Vertex AI
-```
-If no key is configured, TALUS automatically runs in **Deterministic Demonstration Mode**, providing full access to all terrain tools, sample datasets, and interactive visualizations.
+The TALUS AI agent uses NVIDIA's hosted, OpenAI-compatible API
+(`https://integrate.api.nvidia.com/v1`) — no GPU, CUDA or local model is needed. When the app
+opens, enter **your own** NVIDIA API key (from [build.nvidia.com](https://build.nvidia.com))
+in the **🔐 NVIDIA AI Setup** panel and click **Connect NVIDIA AI**. TALUS validates the key
+with one minimal request, then enables the chat.
+
+* The key is held only in your browser session's server-side state, sent only to NVIDIA, and
+  discarded on **Disconnect NVIDIA AI** or when the session ends. It is never read from the
+  environment, `.env` or Streamlit secrets, and never saved, logged or shown.
+* `NVIDIA_MODEL` (optional) selects the hosted model; the default is
+  `nvidia/nemotron-3-super-120b-a12b`, a tool-calling model. The connect step checks that the
+  model is listed and accepts tool definitions.
+* Without a key, the **Direct Structured Analysis** tools (statistics, safe regions, rover
+  route, landing sites, NASA DEM search/fetch) still work fully.
+* Gemini remains available only as an explicit development option:
+  `pip install -e ".[gemini]"`, then `LLM_PROVIDER=gemini` and `GEMINI_API_KEY=...`.

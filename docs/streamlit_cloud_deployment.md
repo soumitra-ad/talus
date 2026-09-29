@@ -20,12 +20,19 @@ the app with 3.12 selected. Try the logs first; the version is rarely the cause.
 ## 2. Secrets (Settings → Secrets), TOML
 
 ```toml
-GEMINI_API_KEY = "YOUR_KEY"
+LLM_PROVIDER = "nvidia"
+# Optional; default shown. Must be an NVIDIA hosted model that supports tool calling.
+# NVIDIA_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 TALUS_ENV = "production"
 TALUS_NASA_DOWNLOADS = "true"
 # Optional: require an access token before the app renders
 # TALUS_ACCESS_TOKEN = "choose-a-long-random-value"
 ```
+
+**Do not put an NVIDIA API key in Secrets.** Each visitor enters their own key in the app's
+*NVIDIA AI Setup* panel; it lives only in that visitor's session and is discarded on
+disconnect. TALUS never reads `NVIDIA_API_KEY` from Secrets or the environment. No
+`GEMINI_API_KEY` is needed.
 
 Rules that matter:
 
@@ -51,18 +58,17 @@ That page hides the cause. To see it:
 | `branch ... does not exist` | app points at `main` | Set branch to `master` |
 | Traceback inside `app/streamlit_app.py` | code error | Send the traceback |
 
-TALUS makes no required network call at startup: the NASA reachability probe has short
-timeouts and a 10-minute cache, and never raises, so Gemini or NASA outages cannot stop the UI
-from loading.
+TALUS makes no AI request at startup (NVIDIA is first contacted when a visitor clicks
+**Connect NVIDIA AI**), and the NASA reachability probe has short timeouts and a 10-minute
+cache and never raises, so NVIDIA or NASA outages cannot stop the UI from loading.
 
 ## 4. Known operating limits
 
-* **Gemini free tier: 20 requests per day per model.** One place question uses about four.
-  When the quota is gone, TALUS shows "Gemini daily quota reached. Terrain tools still
-  available." and answers questions about named places (Shackleton, Haworth, Malapert,
-  Connecting Ridge, Aristarchus) with the deterministic NASA DEM pipeline. It then skips
-  Gemini for 30 minutes. For regular use, enable billing on the Google AI project, or set
-  `GEMINI_MODEL` to a model with a larger free quota.
+* **NVIDIA rate limits apply per visitor key.** On a 429 TALUS shows "NVIDIA API rate limit
+  reached. Please try again later.", answers questions about named places (Shackleton,
+  Haworth, Malapert, Connecting Ridge, Aristarchus) with the deterministic NASA DEM pipeline,
+  and skips NVIDIA for 60 seconds. A key that stops authenticating mid-session returns the
+  visitor to the setup panel.
 * **The DEM cache is empty after every Cloud restart.** The first south-pole question
   downloads LOLA `ldem_75s_240m` (about 29 MB) from PDS Geosciences, which took about
   6 minutes in testing. Later questions are served from the cache.
@@ -72,15 +78,16 @@ from loading.
 Sidebar → **🩺 System health** lists:
 
 * required secrets
-* Gemini
+* NVIDIA NIM (this session's connection state)
 * NASA ODE
 * internet access to the NASA download host
 * DEM cache contents
 * cache-folder writability
 
-Each is shown as 🟢 working, 🟡 warning or 🔴 failed. **Run full health check** adds one live
-Gemini request (it counts against the daily quota). The status bar under the title shows
-Gemini, NASA and DEM Cache at a glance.
+Each is shown as 🟢 working, 🟡 warning or 🔴 failed. The NVIDIA check reports this session's
+connection and makes no AI request. The status bar under the title shows NVIDIA NIM
+(○ Not Connected / 🟡 Connecting / 🟢 Connected / 🔴 Authentication Failed), NASA and DEM
+Cache at a glance.
 
 ## 6. Release checklist
 
@@ -89,7 +96,8 @@ Gemini, NASA and DEM Cache at a glance.
 - [ ] Secrets added exactly as in section 2 (top level), then **Reboot app**
 - [ ] App loads; no "Oh no" (if it appears, read the log as in section 3)
 - [ ] Sidebar → System health: Required secrets 🟢, NASA ODE 🟢, Internet 🟢, Cache folder writable 🟢
-- [ ] **Run full health check** → Gemini 🟢 (or 🔴 "daily quota reached": wait for the reset)
+- [ ] The first screen shows **🔐 NVIDIA AI Setup** with a masked key field and the chat disabled
+- [ ] Enter an NVIDIA API key → **Connect NVIDIA AI** → status bar shows NVIDIA NIM 🟢 Connected
 - [ ] Ask "What is the average elevation around Shackleton Crater?" and wait for the first
       DEM download (several minutes). The Elevation card shows a value, and the Dataset card
       shows LRO / LOLA
