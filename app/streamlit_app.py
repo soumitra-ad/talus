@@ -34,11 +34,21 @@ import hmac
 import html
 import logging
 import os
+import sys
+from pathlib import Path
 from typing import Any
 
 import streamlit as st
 
+# terrain_agent is normally installed by requirements.txt ("-e ."). If that install step was
+# skipped or failed on the host, import it straight from the repository instead of crashing.
+try:
+    import terrain_agent  # noqa: F401
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 from ui_helpers import (
+    STATE_EMOJI,
     TOOL_LABELS,
     analysis_outcome,
     build_terrain_map_figure,
@@ -48,8 +58,10 @@ from ui_helpers import (
     friendly_error_message,
     list_managed_dems,
     nasa_status_from_tool_calls,
+    result_cards,
     sanitize_model_markdown,
     status_badge_html,
+    status_bar_states,
 )
 
 # ---------------------------------------------------------------------------
@@ -63,8 +75,14 @@ from ui_helpers import (
 
 try:
     for _key, _value in st.secrets.items():
-        if isinstance(_value, str) and _key not in os.environ:
-            os.environ[_key] = _value
+        if _key in os.environ:
+            continue
+        # TOML booleans/numbers (TALUS_NASA_DOWNLOADS = true) are mirrored too; ignoring them
+        # silently left NASA downloads disabled in production.
+        if isinstance(_value, bool):
+            os.environ[_key] = "true" if _value else "false"
+        elif isinstance(_value, (str, int, float)):
+            os.environ[_key] = str(_value)
 except Exception:
     pass
 
@@ -92,10 +110,22 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-.talus-sub { color:#94a3b8; font-size:0.9rem; margin-top:-0.6rem; }
+.talus-header { border-top:1px solid #334155; border-bottom:1px solid #334155; padding:10px 0 8px 0; margin-bottom:8px; }
+.talus-title { font-size:1.9rem; font-weight:700; line-height:1.2; }
+.talus-sub { color:#94a3b8; font-size:0.95rem; }
 .status-bar { display:flex; flex-wrap:wrap; gap:6px; margin:6px 0 10px 0; }
-.pill { border:1px solid #334155; border-radius:999px; padding:2px 10px; font-size:0.78rem; color:#cbd5e1; white-space:nowrap; }
-.dot-ok { color:#22c55e; } .dot-warn { color:#f59e0b; } .dot-err { color:#ef4444; } .dot-idle { color:#64748b; }
+.pill { border:1px solid #334155; border-radius:999px; padding:2px 10px; font-size:0.8rem; white-space:nowrap; }
+/* Chat bubbles: rounded, lightly tinted; the user's turn is tinted blue. */
+[data-testid="stChatMessage"] { border-radius:16px; padding:0.6rem 0.9rem; margin-bottom:0.5rem;
+    background: rgba(148,163,184,0.08); border:1px solid rgba(148,163,184,0.18); }
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]),
+[data-testid="stChatMessage"]:has([aria-label="Chat message from user"]) { background: rgba(59,130,246,0.12); }
+[data-testid="stMetricValue"] { font-size:1.25rem; }
+@media (max-width: 640px) {
+    .talus-title { font-size:1.5rem; }
+    [data-testid="stChatMessage"] { padding:0.5rem 0.6rem; }
+    [data-testid="stMetricValue"] { font-size:1.05rem; }
+}
 .badge-pass { background: #166534; color: #86efac; padding: 3px 10px; border-radius: 20px; font-weight: 700; font-size: 0.8rem; }
 .badge-review { background: #78350f; color: #fde68a; padding: 3px 10px; border-radius: 20px; font-weight: 700; font-size: 0.8rem; }
 .badge-fail { background: #7f1d1d; color: #fca5a5; padding: 3px 10px; border-radius: 20px; font-weight: 700; font-size: 0.8rem; }
@@ -131,6 +161,7 @@ def _init_session() -> None:
         "messages": [],
         "nasa_status": "unknown",
         "gemini_health": None,
+        "system_health": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -195,6 +226,28 @@ def _build_agent(api_key: str | None, model_name: str) -> Any:
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_managed_dems() -> list[str]:
     return list_managed_dems()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_network_health() -> dict[str, Any] | None:
+    """NASA ODE + download-host probes, at most once per 10 minutes per server process.
+    Short timeouts; never raises; skipped entirely when network checks are switched off."""
+    from terrain_agent.health import check_internet, check_nasa_ode, network_checks_enabled
+
+    if not network_checks_enabled():
+        return None
+    try:
+        return {"nasa": check_nasa_ode(), "internet": check_internet()}
+    except Exception:
+        log.exception("Network health probe failed")
+        return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_cache_writable() -> dict[str, Any]:
+    from terrain_agent.health import check_cache_writable
+
+    return check_cache_writable()
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -267,23 +320,38 @@ with st.sidebar:
                 "tab, and a DEM will be fetched from NASA.")
 
     st.markdown("### 🤖 AI Status")
-    if agent is not None and getattr(agent, "is_live", False):
+    _agent_block = agent.model_block if agent is not None and hasattr(agent, "model_block") else None
+    if _agent_block:
+        st.warning(_agent_block["message"])
+    elif agent is not None and getattr(agent, "is_live", False):
         st.success(f"Gemini Active ({_MODEL_NAME})")
     else:
         st.info("Demo Mode — set GEMINI_API_KEY for live AI analysis. "
-                "The Direct Analysis tools work without one.")
-    if st.button("Run Gemini health check", width="stretch"):
-        from terrain_agent.agent import check_gemini_health
-        with st.spinner("Contacting Gemini…"):
-            st.session_state.gemini_health = check_gemini_health(_GEMINI_KEY, _MODEL_NAME)
-    health = st.session_state.gemini_health
-    if health:
-        st.caption(
-            f"Configured: {'YES' if health['configured'] else 'NO'} · "
-            f"Request: {health['request']} · "
-            f"Latency: {fmt(health['latency_s'], ' s')}"
-            + (f" · Error: {health['error_category']}" if health.get("error_category") else "")
-        )
+                "Questions about a named place still get a deterministic NASA DEM analysis.")
+
+    with st.expander("🩺 System health"):
+        _health_checks = st.session_state.get("system_health")
+        if st.button("Run full health check", width="stretch",
+                     help="Includes one live Gemini request (the free tier allows ~20 per day)."):
+            from terrain_agent.health import check_system_health, network_checks_enabled
+            with st.spinner("Checking Gemini, NASA ODE, internet and the DEM cache…"):
+                _health_checks = check_system_health(
+                    network=network_checks_enabled(), gemini_live=True, observed_gemini_block=_agent_block,
+                )
+            st.session_state.system_health = _health_checks
+            gemini_check = next((c for c in _health_checks if c["name"] == "Gemini API"), None)
+            if gemini_check:
+                st.session_state.gemini_health = {"request": "SUCCESS" if gemini_check["state"] == "ok" else "FAIL"}
+            _cached_network_health.clear()
+            _cached_cache_writable.clear()
+        if _health_checks is None:
+            from terrain_agent.health import check_dem_cache, check_gemini, check_secrets
+            _probe = _cached_network_health() or {}
+            _health_checks = [check_secrets(), check_gemini(observed_block=_agent_block)]
+            _health_checks += [_probe[k] for k in ("nasa", "internet") if k in _probe]
+            _health_checks += [check_dem_cache(), _cached_cache_writable()]
+        for check in _health_checks:
+            st.caption(f"{STATE_EMOJI.get(check['state'], '⚪')} **{check['name']}** — {check['detail']}")
 
     if st.button("🗑️ Clear Conversation", width="stretch"):
         st.session_state.messages = []
@@ -302,44 +370,28 @@ with st.sidebar:
 # Header and status bar
 # ---------------------------------------------------------------------------
 
-st.markdown("# 🌕 TALUS")
 st.markdown(
-    '<div class="talus-sub"><strong>Lunar Terrain Analysis Agent</strong> · '
-    "AI-assisted terrain intelligence for lunar landing and rover operations</div>",
+    '<div class="talus-header"><div class="talus-title">🌕 TALUS AI</div>'
+    '<div class="talus-sub">Lunar Terrain Intelligence Agent</div></div>',
     unsafe_allow_html=True,
 )
 
-
-def _pill(label: str, state: str, dot: str) -> str:
-    return f'<span class="pill">{html.escape(label)}: <span class="{dot}">●</span> {html.escape(state)}</span>'
-
-
-_gemini_live = agent is not None and getattr(agent, "is_live", False)
-_health = st.session_state.gemini_health
-if _gemini_live and _health and _health.get("request") == "FAIL":
-    gemini_pill = _pill("Gemini", "Error", "dot-err")
-elif _gemini_live:
-    gemini_pill = _pill("Gemini", "Active", "dot-ok")
-else:
-    gemini_pill = _pill("Gemini", "Demo mode", "dot-warn")
-
-_nasa_states = {
-    "unknown": ("Not yet contacted", "dot-idle"),
-    "connected": ("Connected", "dot-ok"),
-    "error": ("Error", "dot-err"),
-    "disabled": ("Downloads disabled", "dot-warn"),
-}
-if not _NASA_DOWNLOADS and st.session_state.nasa_status == "unknown":
-    nasa_state, nasa_dot = _nasa_states["disabled"]
-else:
-    nasa_state, nasa_dot = _nasa_states.get(st.session_state.nasa_status, _nasa_states["unknown"])
-
-dem_state = f"Ready · {len(available_dems)} cached" if available_dems else "Ready · none cached"
+_states = status_bar_states(
+    gemini_configured=agent is not None and getattr(agent, "is_live", False),
+    gemini_block=_agent_block,
+    gemini_health=st.session_state.gemini_health,
+    nasa_observed=st.session_state.nasa_status,
+    nasa_probe=(_cached_network_health() or {}).get("nasa"),
+    downloads_enabled=_NASA_DOWNLOADS,
+    dem_count=len(available_dems),
+    cache_writable=_cached_cache_writable()["state"] != "fail",
+)
 st.markdown(
     '<div class="status-bar">'
-    + gemini_pill
-    + _pill("NASA ODE", nasa_state, nasa_dot)
-    + _pill("DEM Engine", dem_state, "dot-ok")
+    + "".join(
+        f'<span class="pill">{html.escape(name)}: {STATE_EMOJI[state]} {html.escape(text)}</span>'
+        for name, (state, text) in _states.items()
+    )
     + "</div>",
     unsafe_allow_html=True,
 )
@@ -511,6 +563,12 @@ def _render_dataset_panel(dataset: dict[str, Any] | None) -> None:
         st.caption(f"⚠️ {w}")
 
 
+_NASA_OUTAGE_ERRORS = frozenset({
+    "ProviderUnavailableError", "ProviderResponseError", "DownloadError", "DownloadTimeoutError",
+    "DownloadIncompleteError", "HostPolicyError",
+})
+
+
 def _pixel_size(prov: dict[str, Any]) -> Any:
     size = prov.get("pixel_size_m")
     return size[0] if isinstance(size, list) and size else None
@@ -524,6 +582,17 @@ def _render_fetch_panel(result: dict[str, Any]) -> None:
             st.warning("NASA DEM downloads are disabled in this deployment.")
         else:
             st.error(friendly_error_message(result))
+            if result.get("error_type") in _NASA_OUTAGE_ERRORS:
+                # Cached DEMs covering the area are always tried before NASA, so reaching this
+                # point means the cache has nothing for this location.
+                cached = list_managed_dems()
+                st.warning(
+                    f"Working from the local DEM cache only: {len(cached)} cached DEM(s), none "
+                    "covering this location. Analyses of cached areas still work."
+                    if cached else
+                    "Working from the local DEM cache only, and it is empty. Terrain analysis "
+                    "resumes when NASA ODE is reachable again."
+                )
         return
     origin = "from cache" if result.get("from_cache") else "downloaded from NASA"
     prov = result.get("provenance") or {}
@@ -606,51 +675,16 @@ def _latest(tool_calls: list[dict[str, Any]], *tools: str) -> dict[str, Any] | N
 
 
 def _render_result_cards(tool_calls: list[dict[str, Any]]) -> None:
-    """Compact metric cards built only from structured tool results."""
-    stats: dict[str, Any] = {}
-    resolution = None
-    for tc in tool_calls:
-        result = tc.get("result")
-        if tc.get("tool") in ("get_elevation_stats", "get_slope_stats", "get_roughness_stats") and isinstance(result, dict):
-            analysis = result.get("analysis") or {}
-            if analysis.get("terrain_available"):
-                for key in ("elevation", "slope", "roughness"):
-                    if analysis.get(key):
-                        stats[key] = analysis[key]
-                resolution = result.get("resolution_m") or resolution
-    cards: list[tuple[str, str]] = []
-    if stats.get("elevation"):
-        e = stats["elevation"]
-        cards += [("Average elevation", fmt(e.get("mean_m"), " m")), ("Min / max elevation", f"{fmt(e.get('min_m'), ' m', 0)} / {fmt(e.get('max_m'), ' m', 0)}")]
-    if stats.get("slope"):
-        s = stats["slope"]
-        cards += [("Mean slope", fmt(s.get("mean_slope_deg"), "°")), ("Max slope", fmt(s.get("max_slope_deg"), "°"))]
-    if stats.get("roughness"):
-        cards.append(("Mean roughness (TRI)", fmt(stats["roughness"].get("mean_tri_m"), " m")))
-    rover = _latest(tool_calls, "evaluate_traverse_route")
-    if rover:
-        cards.append(("Rover route status", str(rover.get("overall_status") or "—")))
-    regions = _latest(tool_calls, "find_safe_regions")
-    if regions:
-        n = len(((regions.get("analysis") or {}).get("regions")) or [])
-        cards.append(("Safe regions found", str(n)))
-    landing = _latest(tool_calls, "evaluate_landing_sites")
-    if landing:
-        cards.append(("Landing sites ranked", f"{landing.get('sites_ranked', 0)} of {landing.get('sites_evaluated', 0)}"))
-
-    fetch = _latest(tool_calls, "fetch_nasa_dem")
-    if fetch:
-        prov = fetch.get("provenance") or {}
-        cards.append(("Dataset", f"{prov.get('mission') or '—'} / {prov.get('instrument') or '—'}"))
-        cards.append(("Source", "NASA ODE / PDS"))
-    if resolution is not None:
-        cards.append(("Resolution", fmt(resolution, " m", 1)))
-
-    for start in range(0, len(cards), 3):
-        row = cards[start : start + 3]
-        cols = st.columns(3)
-        for col, (label, value) in zip(cols, row):
-            col.metric(label, value)
+    """Elevation / Slope / Dataset / Safety score cards, 2 × 2 (stacks on phones)."""
+    cards = result_cards(tool_calls)
+    if not cards:
+        return
+    for row in (cards[:2], cards[2:]):
+        cols = st.columns(2)
+        for col, card in zip(cols, row):
+            with col.container(border=True):
+                st.metric(card["label"], card["value"])
+                st.caption(card["detail"])
 
 
 def _render_evidence(tool_calls: list[dict[str, Any]]) -> None:
@@ -712,7 +746,10 @@ def _render_evidence(tool_calls: list[dict[str, Any]]) -> None:
 def _render_assistant_message(msg: dict[str, Any]) -> None:
     status = msg.get("status")
     tool_calls = msg.get("tool_calls") or []
-    if msg.get("is_demo"):
+    if msg.get("notice"):
+        # Gemini was unavailable and this answer came from the deterministic pipeline.
+        st.warning(f"{msg['notice']} This answer was produced by the deterministic NASA DEM tools only.")
+    elif msg.get("is_demo"):
         st.info("📡 Demo Mode — set GEMINI_API_KEY for live AI analysis, or use the Direct "
                 "Analysis tools below, which work without one.")
     if status in ("invalid_request", "rate_limited", "model_error"):
@@ -775,7 +812,7 @@ if query:
     with st.chat_message("user", avatar="🧑‍🚀"):
         st.text(query)
     with st.chat_message("assistant", avatar="🌕"):
-        with st.status("Analyzing your request…", expanded=True) as activity:
+        with st.status("TALUS is analyzing…", expanded=True) as activity:
             def _on_event(kind: str, info: dict[str, Any]) -> None:
                 if kind == "model" and info.get("phase") == "interpreting":
                     activity.write("⏳ Interpreting terrain request")
@@ -794,17 +831,20 @@ if query:
                     "tool_calls": [], "is_demo": True,
                 }
             failed = result.get("status") in ("invalid_request", "rate_limited", "model_error")
-            activity.update(
-                label="Analysis could not be completed" if failed else "Analysis complete",
-                state="error" if failed else "complete",
-                expanded=False,
-            )
+            if failed:
+                label = "Analysis could not be completed"
+            elif result.get("status") == "fallback":
+                label = "Analysis complete (deterministic mode — Gemini unavailable)"
+            else:
+                label = "Analysis complete"
+            activity.update(label=label, state="error" if failed else "complete", expanded=False)
     tool_calls = result.get("tool_calls") or []
     st.session_state.messages.append(
         {
             "role": "assistant",
             "content": result.get("text", ""),
             "status": result.get("status"),
+            "notice": result.get("notice") if result.get("status") == "fallback" else None,
             "is_demo": result.get("is_demo", False),
             "tool_calls": tool_calls,
         }
@@ -838,16 +878,52 @@ tab_dataset, tab_stats, tab_regions, tab_rover, tab_landing, tab_search = st.tab
 _DEM_HELP = "Only DEMs already present in the managed cache/sample directories are offered."
 
 
-def _dem_selector(key: str) -> str | None:
-    if not available_dems:
-        st.info("No DEMs cached yet — fetch one from the NASA DEM tab first.")
+AUTO_DEM = "⬇️ Auto — fetch a NASA DEM covering this area"
+
+
+def _dem_selector(key: str, allow_auto: bool = True) -> str | None:
+    """Cached DEMs, plus (for location-based tools) an Auto option that searches NASA ODE,
+    downloads and caches a covering DEM, then continues -- the default when nothing is cached."""
+    options = list(available_dems) + ([AUTO_DEM] if allow_auto else [])
+    if not options:
+        st.info("No DEMs cached yet — ask the agent about a place, or use a location-based tab; "
+                "a NASA DEM is downloaded automatically.")
         return None
-    index = available_dems.index(default_dem) if default_dem in available_dems else 0
-    return st.selectbox("DEM file", options=available_dems, index=index, help=_DEM_HELP, key=key)
+    index = options.index(default_dem) if default_dem in options else len(options) - 1 if not available_dems else 0
+    return st.selectbox("DEM", options=options, index=index, help=_DEM_HELP, key=key)
+
+
+def _resolve_dem(choice: str, points: list[tuple[float, float]], extra_km: float = 0.0) -> str | None:
+    """Return a DEM path for *choice*; for Auto, obtain one covering *points* from NASA
+    (cache first, then search + download), showing progress and any failure plainly."""
+    if choice != AUTO_DEM:
+        return choice
+    from terrain_agent.data.lunar_features import covering_circle
+
+    try:
+        lat, lon, radius_km = covering_circle(points, margin_km=1.0 + extra_km)
+    except Exception as exc:  # oversized or invalid area: explain instead of fetching
+        st.error(f"Cannot fetch one DEM for this area: {str(exc)[:200]}")
+        return None
+    with st.spinner("Searching NASA ODE and loading a DEM (a first download can take several minutes)…"):
+        fetched = _dispatch("fetch_nasa_dem", {"lat": lat, "lon": lon, "radius_km": radius_km})
+    new_nasa = nasa_status_from_tool_calls([{"tool": "fetch_nasa_dem", "result": fetched}])
+    if new_nasa:
+        st.session_state.nasa_status = new_nasa
+    if fetched.get("status") != "ok":
+        _render_fetch_panel(fetched)
+        return None
+    _cached_managed_dems.clear()
+    prov = fetched.get("provenance") or {}
+    st.caption(
+        f"Using NASA {prov.get('mission')} / {prov.get('instrument')} {prov.get('product_id')} "
+        f"({'from cache' if fetched.get('from_cache') else 'downloaded'})."
+    )
+    return fetched["dem_path"]
 
 
 with tab_dataset:
-    dem = _dem_selector("dataset_dem")
+    dem = _dem_selector("dataset_dem", allow_auto=False)
     with st.form("dataset_form"):
         c1, c2 = st.columns(2)
         lat = c1.number_input("Reference latitude (° , optional)", value=0.0, min_value=-90.0, max_value=90.0, key="ds_lat")
@@ -877,7 +953,7 @@ with tab_stats:
         st.caption("Requests are limited to a 2048×2048 cell read window; a box that is too "
                    "large for the DEM's resolution is rejected rather than silently truncated.")
         go = st.form_submit_button("Compute terrain statistics", disabled=dem is None)
-    if go and dem:
+    if go and dem and (dem := _resolve_dem(dem, [(min_lat, min_lon), (min_lat, max_lon), (max_lat, min_lon), (max_lat, max_lon)])):
         box = {"dem_path": dem, "min_lat": min_lat, "max_lat": max_lat, "min_lon": min_lon, "max_lon": max_lon}
         with st.spinner("Computing elevation, slope and roughness…"):
             elev = _cached_dispatch("get_elevation_stats", box)
@@ -908,7 +984,7 @@ with tab_regions:
         region_slope = c4.number_input("Max slope (°)", value=float(max_slope), min_value=0.1, max_value=90.0)
         min_area = c5.number_input("Min region area (m²)", value=50_000.0, min_value=100.0, step=1000.0)
         go = st.form_submit_button("Find safe regions", disabled=dem is None)
-    if go and dem:
+    if go and dem and (dem := _resolve_dem(dem, [(center_lat, center_lon)], extra_km=radius_m / 1000.0)):
         with st.spinner("Searching for safe regions…"):
             result = _cached_dispatch(
                 "find_safe_regions",
@@ -944,8 +1020,8 @@ with tab_rover:
         rover_slope = c1.number_input("Max slope (°)", value=float(max_slope), min_value=0.1, max_value=90.0)
         rover_roughness = c2.number_input("Max roughness TRI (m, 0 = not evaluated)", value=0.0, min_value=0.0)
         go = st.form_submit_button("Evaluate route safety", disabled=dem is None)
-    if go and dem:
-        waypoints = [[float(r["lat"]), float(r["lon"])] for r in waypoints_df if r.get("lat") is not None and r.get("lon") is not None]
+    waypoints = [[float(r["lat"]), float(r["lon"])] for r in waypoints_df if r.get("lat") is not None and r.get("lon") is not None]
+    if go and dem and waypoints and (dem := _resolve_dem(dem, [tuple(w) for w in waypoints])):
         args: dict[str, Any] = {"waypoints": waypoints, "dem_path": dem, "max_slope_deg": rover_slope}
         if rover_roughness > 0:
             args["max_roughness_tri"] = rover_roughness
@@ -975,8 +1051,12 @@ with tab_landing:
         landing_slope = c1.number_input("Max slope (°)", value=float(max_slope), min_value=0.1, max_value=90.0, key="landing_slope")
         landing_flat_radius = c2.number_input("Min flat radius (m)", value=100.0, min_value=0.0)
         go = st.form_submit_button("Evaluate landing sites", disabled=dem is None)
-    if go and dem:
-        sites = [{"id": str(r["id"]), "lat": float(r["lat"]), "lon": float(r["lon"])} for r in sites_df if r.get("id")]
+    sites = [
+        {"id": str(r["id"]), "lat": float(r["lat"]), "lon": float(r["lon"])}
+        for r in sites_df
+        if r.get("id") and r.get("lat") is not None and r.get("lon") is not None
+    ]
+    if go and dem and sites and (dem := _resolve_dem(dem, [(s["lat"], s["lon"]) for s in sites])):
         with st.spinner("Evaluating candidate sites…"):
             result = _dispatch(
                 "evaluate_landing_sites",

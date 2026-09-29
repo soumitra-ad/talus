@@ -291,7 +291,9 @@ def test_tool_results_survive_a_model_failure_later_in_the_turn(wired):
                 return _FlakyChat()
 
     agent = TALUSAgent(client=_Client(), dem_cache_dir=cache_dir)
-    result = agent.chat("elevation around Shackleton?")
+    # Names no gazetteer feature, so the deterministic fallback cannot take over and the
+    # partial tool results must be returned as they are.
+    result = agent.chat("what is the elevation over there?")
 
     assert result["status"] == "model_error"
     assert [c["tool"] for c in result["tool_calls"]] == ["resolve_lunar_feature"]

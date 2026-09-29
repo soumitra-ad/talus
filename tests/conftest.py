@@ -2,8 +2,12 @@
 
 import json
 import math
+import os
 import sys
 from pathlib import Path
+
+# The offline suite must never probe NASA: the app's startup health check honours this switch.
+os.environ.setdefault("TALUS_HEALTH_NETWORK_CHECK", "false")
 
 import numpy as np
 import pytest

@@ -236,3 +236,39 @@ def test_model_markdown_cannot_load_remote_images():
 )
 def test_nasa_and_tool_failures_have_plain_messages(error_type, expected):
     assert friendly_error_message({"status": "error", "error_type": error_type}) == expected
+
+def test_result_cards_show_only_tool_values():
+    fetch = _tc("fetch_nasa_dem", "ok", provenance={"mission": "LRO", "instrument": "LOLA", "product_id": "ldem_75s_240m", "pixel_size_m": [240.0, 240.0]})
+    elev = _tc("get_elevation_stats", "ok", resolution_m=240.0, analysis={"terrain_available": True, "elevation": {"mean_m": -185.54, "min_m": -2855.5, "max_m": 1954.5}})
+    cards = {c["label"]: c for c in _uh.result_cards([fetch, elev])}
+    assert cards["Elevation (mean)"]["value"] == "-185.54 m"
+    assert cards["Slope (mean)"]["value"] == "—"
+    assert cards["Dataset"]["value"] == "LRO / LOLA" and "ldem_75s_240m" in cards["Dataset"]["detail"]
+    assert cards["Safety score"]["value"] == "Not evaluated"
+    assert _uh.result_cards([]) is None
+
+
+def test_safety_score_comes_from_the_safety_tools():
+    rover = _tc("evaluate_traverse_route", "ok", overall_status="FAIL", risk_score=72.0)
+    assert {c["label"]: c for c in _uh.result_cards([rover])}["Safety score"]["value"] == "FAIL"
+    regions = _tc("find_safe_regions", "ok", configured_threshold_deg=15.0, analysis={"safe_fraction_of_assessed": 0.5427, "regions": [{}, {}]})
+    card = {c["label"]: c for c in _uh.result_cards([regions])}["Safety score"]
+    assert card["value"] == "54%" and "15.0°" in card["detail"] and "2 safe region" in card["detail"]
+
+
+def test_status_bar_states():
+    base = dict(gemini_configured=True, gemini_block=None, gemini_health=None, nasa_observed="unknown",
+                nasa_probe={"state": "ok"}, downloads_enabled=True, dem_count=1, cache_writable=True)
+    assert {k: v[0] for k, v in _uh.status_bar_states(**base).items()} == {"Gemini": "ok", "NASA": "ok", "DEM Cache": "ok"}
+    s = _uh.status_bar_states(**{**base, "gemini_block": {"category": "quota_daily"}})
+    assert s["Gemini"] == ("fail", "Daily quota reached")
+    assert _uh.status_bar_states(**{**base, "gemini_configured": False})["Gemini"][0] == "warn"
+    assert _uh.status_bar_states(**{**base, "nasa_observed": "error"})["NASA"][0] == "fail"
+    assert _uh.status_bar_states(**{**base, "nasa_probe": None})["NASA"] == ("warn", "Not checked")
+    assert _uh.status_bar_states(**{**base, "downloads_enabled": False})["NASA"] == ("warn", "Downloads disabled")
+    assert _uh.status_bar_states(**{**base, "dem_count": 0})["DEM Cache"][0] == "warn"
+    assert _uh.status_bar_states(**{**base, "cache_writable": False})["DEM Cache"][0] == "fail"
+
+
+def test_fallback_counts_as_a_completed_analysis():
+    assert _uh.analysis_outcome("fallback", [_tc("get_elevation_stats", "ok")]) == "Completed"

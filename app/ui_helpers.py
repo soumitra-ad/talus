@@ -131,7 +131,7 @@ def build_trace(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def analysis_outcome(status: str | None, tool_calls: list[dict[str, Any]]) -> str:
     """Completed / Partially completed / Not completed, from structured statuses only."""
-    if status not in ("ok", None) or not tool_calls:
+    if status not in ("ok", "fallback", None) or not tool_calls:
         return "Not completed"
     statuses = [tc.get("result_status") or (tc.get("result") or {}).get("status") for tc in tool_calls]
     if all(s in _OK_STATUSES for s in statuses):
@@ -158,6 +158,136 @@ def nasa_status_from_tool_calls(tool_calls: list[dict[str, Any]]) -> str | None:
         elif status == "error" and result.get("error_type") in ("ProviderUnavailableError", "ProviderResponseError"):
             state = "error"
     return state
+
+
+def _latest_ok(tool_calls: list[dict[str, Any]], *tools: str) -> dict[str, Any] | None:
+    for tc in reversed(tool_calls):
+        result = tc.get("result")
+        if tc.get("tool") in tools and isinstance(result, dict) and result.get("status") == "ok":
+            return result
+    return None
+
+
+def result_cards(tool_calls: list[dict[str, Any]]) -> list[dict[str, str]] | None:
+    """The four summary cards -- Elevation, Slope, Dataset, Safety score -- as
+    ``{"label", "value", "detail"}``, or ``None`` when no terrain tool produced anything.
+
+    Every value is formatted from a structured tool result; nothing is computed here. The
+    safety score is the rover tool's own risk score, or the safe-region tool's measured share
+    of cells within the configured threshold; otherwise it is reported as not evaluated.
+    """
+    stats: dict[str, Any] = {}
+    resolution = None
+    for tc in tool_calls:
+        result = tc.get("result")
+        if tc.get("tool") in ("get_elevation_stats", "get_slope_stats", "get_roughness_stats") and isinstance(result, dict):
+            analysis = result.get("analysis") or {}
+            if analysis.get("terrain_available"):
+                stats.update({k: analysis[k] for k in ("elevation", "slope", "roughness") if analysis.get(k)})
+                resolution = result.get("resolution_m") or resolution
+    fetch = _latest_ok(tool_calls, "fetch_nasa_dem")
+    rover = _latest_ok(tool_calls, "evaluate_traverse_route")
+    regions = _latest_ok(tool_calls, "find_safe_regions")
+    landing = _latest_ok(tool_calls, "evaluate_landing_sites")
+    if not (stats or fetch or rover or regions or landing):
+        return None
+
+    e, s, r = stats.get("elevation") or {}, stats.get("slope") or {}, stats.get("roughness") or {}
+    elevation = {
+        "label": "Elevation (mean)",
+        "value": fmt(e.get("mean_m"), " m") if e else "—",
+        "detail": f"min {fmt(e.get('min_m'), ' m', 0)} · max {fmt(e.get('max_m'), ' m', 0)}" if e else "Not measured",
+    }
+    slope_detail = f"max {fmt(s.get('max_slope_deg'), '°')}" if s else "Not measured"
+    if r:
+        slope_detail += f" · roughness TRI {fmt(r.get('mean_tri_m'), ' m')}"
+    slope = {"label": "Slope (mean)", "value": fmt(s.get("mean_slope_deg"), "°") if s else "—", "detail": slope_detail}
+
+    if fetch:
+        prov = fetch.get("provenance") or {}
+        size = prov.get("pixel_size_m")
+        cell = size[0] if isinstance(size, list) and size else resolution
+        dataset = {
+            "label": "Dataset",
+            "value": f"{prov.get('mission') or '—'} / {prov.get('instrument') or '—'}",
+            "detail": f"{prov.get('product_id') or '—'} · {fmt(cell, ' m', 0)} cells · NASA ODE",
+        }
+    else:
+        dataset = {"label": "Dataset", "value": "—", "detail": "No NASA DEM in this answer"}
+
+    if rover:
+        safety = {
+            "label": "Safety score",
+            "value": str(rover.get("overall_status") or "—"),
+            "detail": f"route risk {fmt(rover.get('risk_score'), '/100', 0)} (uncalibrated)",
+        }
+    elif regions:
+        analysis = regions.get("analysis") or {}
+        frac = analysis.get("safe_fraction_of_assessed")
+        threshold = regions.get("configured_threshold_deg")
+        safety = {
+            "label": "Safety score",
+            "value": fmt_pct(frac) if frac is not None else "—",
+            "detail": f"of cells ≤ {fmt(threshold, '°', 1)} (configured threshold) · "
+            f"{len(analysis.get('regions') or [])} safe region(s)",
+        }
+    elif landing:
+        safety = {
+            "label": "Safety score",
+            "value": f"{landing.get('sites_ranked', 0)}/{landing.get('sites_evaluated', 0)} ranked",
+            "detail": "landing sites meeting configured thresholds",
+        }
+    else:
+        safety = {"label": "Safety score", "value": "Not evaluated", "detail": "Ask about rover or landing safety"}
+    return [elevation, slope, dataset, safety]
+
+
+STATE_EMOJI = {"ok": "🟢", "warn": "🟡", "fail": "🔴"}
+
+
+def status_bar_states(
+    *,
+    gemini_configured: bool,
+    gemini_block: dict[str, Any] | None,
+    gemini_health: dict[str, Any] | None,
+    nasa_observed: str,
+    nasa_probe: dict[str, Any] | None,
+    downloads_enabled: bool,
+    dem_count: int,
+    cache_writable: bool,
+) -> dict[str, tuple[str, str]]:
+    """``{"Gemini" | "NASA" | "DEM Cache": (state, text)}`` with state ok / warn / fail.
+
+    What the app actually observed this session (a failed call, a quota block, a live
+    NASA fetch) takes precedence over the periodic probe, which can be up to ten minutes old.
+    """
+    if gemini_block:
+        gemini = ("fail", "Daily quota reached" if gemini_block.get("category") == "quota_daily" else "Unavailable")
+    elif not gemini_configured:
+        gemini = ("warn", "Not configured")
+    elif gemini_health and gemini_health.get("request") == "FAIL":
+        gemini = ("fail", "Error")
+    else:
+        gemini = ("ok", "Active")
+
+    if not downloads_enabled:
+        nasa = ("warn", "Downloads disabled")
+    elif nasa_observed == "error":
+        nasa = ("fail", "Unreachable")
+    elif nasa_observed == "connected":
+        nasa = ("ok", "Connected")
+    elif nasa_probe is None:
+        nasa = ("warn", "Not checked")
+    else:
+        nasa = (nasa_probe.get("state", "warn"), {"ok": "Reachable", "warn": "Degraded", "fail": "Unreachable"}.get(nasa_probe.get("state"), "Unknown"))
+
+    if not cache_writable:
+        cache = ("fail", "Not writable")
+    elif dem_count:
+        cache = ("ok", f"{dem_count} cached")
+    else:
+        cache = ("warn", "Empty · auto-download")
+    return {"Gemini": gemini, "NASA": nasa, "DEM Cache": cache}
 
 
 _MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")

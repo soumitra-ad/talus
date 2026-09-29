@@ -682,19 +682,21 @@ def test_shackleton_answer_renders_result_cards_evidence_and_nasa_status(app, mo
     monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: fake)
 
     app.run()
-    assert any("Not yet contacted" in m.value or "Downloads disabled" in m.value for m in app.markdown)
+    # Offline suite: the network probe is off, so NASA is not claimed healthy before any contact.
+    assert any("NASA: 🟡" in m.value for m in app.markdown)
     app.chat_input[0].set_value("What is the average elevation around Shackleton Crater?").run()
 
     assert not app.exception
     metrics = {m.label: m.value for m in app.metric}
-    assert metrics["Average elevation"] == "-185.54 m"
+    assert metrics["Elevation (mean)"] == "-185.54 m"
     assert metrics["Dataset"] == "LRO / LOLA"
-    assert metrics["Source"] == "NASA ODE / PDS"
+    assert metrics["Safety score"] == "Not evaluated"  # no safety tool ran: nothing invented
     captions = " ".join(c.value for c in app.caption)
     assert "Analysis status: Completed" in captions
+    assert "ldem_75s_240m" in captions and "NASA ODE" in captions
     assert "Resolving lunar coordinates" in captions and "Calculating elevation" in captions
     assert any("ldem_75s_240m" in m.value for m in app.markdown)
-    assert any("NASA ODE" in m.value and "Connected" in m.value for m in app.markdown)
+    assert any("NASA: 🟢 Connected" in m.value for m in app.markdown)
 
 
 def test_follow_up_history_uses_gemini_roles_and_reruns_do_not_repeat_calls(app, monkeypatch):
@@ -744,4 +746,90 @@ def test_model_error_keeps_deterministic_results_visible(app, monkeypatch):
     assert not app.exception
     assert any("Gemini service is currently unavailable" in w.value for w in app.warning)
     assert any("Analysis status: Not completed" in c.value for c in app.caption)
-    assert {m.label for m in app.metric} >= {"Dataset", "Source"}
+    metrics = {m.label: m.value for m in app.metric}
+    assert metrics["Dataset"] == "LRO / LOLA"
+    assert metrics["Elevation (mean)"] == "—"  # the elevation step never ran: shown as missing
+
+# ---------------------------------------------------------------------------
+# Deployment hardening: Gemini fallback display, auto DEM download, secrets mirroring
+# ---------------------------------------------------------------------------
+
+
+def test_quota_fallback_answer_shows_the_notice_and_deterministic_cards(app, monkeypatch):
+    import terrain_agent.agent as agent_pkg
+
+    class _FallbackAgent(_FakeAgent):
+        def chat(self, user_message, history=None, max_slope_deg=15.0, on_event=None):
+            return {
+                "status": "fallback", "notice": "Gemini daily quota reached. Terrain tools still available.",
+                "text": "Deterministic analysis of **Shackleton Crater**: mean elevation **-185.54 m**.",
+                "tool_calls": _shackleton_tool_calls(), "is_demo": False, "error_category": "quota_daily",
+            }
+
+    monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: _FallbackAgent(""))
+
+    app.run()
+    app.chat_input[0].set_value("What is the average elevation around Shackleton Crater?").run()
+
+    assert not app.exception
+    assert any("Gemini daily quota reached. Terrain tools still available." in w.value for w in app.warning)
+    assert {m.label: m.value for m in app.metric}["Elevation (mean)"] == "-185.54 m"
+    assert any("Analysis status: Completed" in c.value for c in app.caption)
+
+
+def test_statistics_tab_auto_downloads_a_dem_when_none_is_cached(app, monkeypatch):
+    _mock_managed_dems(monkeypatch, [])
+    calls = []
+
+    def fake_dispatch(tool_name, args, dem_cache_dir=None):
+        calls.append((tool_name, dict(args)))
+        if tool_name == "fetch_nasa_dem":
+            return {"status": "ok", "dem_path": "nasa/ldem_75s_240m-x.tif", "from_cache": False,
+                    "provenance": {"mission": "LRO", "instrument": "LOLA", "product_id": "ldem_75s_240m"}}
+        return {"status": "ok", "resolution_m": 240.0, "analysis": {
+            "terrain_available": True, "coverage_fraction": 1.0,
+            "elevation": {"mean_m": -185.5, "min_m": -2855.5, "max_m": 1954.5}, "slope": None, "roughness": None}}
+
+    _mock_dispatch(monkeypatch, fake_dispatch)
+
+    app.run()
+    tab = app.tabs[1]  # Statistics
+    assert tab.selectbox[0].value.startswith("⬇️ Auto")
+    next(b for b in tab.button if "Compute terrain statistics" in b.label).click().run()
+
+    assert not app.exception
+    assert calls[0][0] == "fetch_nasa_dem"
+    assert {c[0] for c in calls[1:]} == {"get_elevation_stats", "get_slope_stats", "get_roughness_stats"}
+    assert all(c[1]["dem_path"] == "nasa/ldem_75s_240m-x.tif" for c in calls[1:])
+    assert any("ldem_75s_240m" in c.value for c in app.caption)
+
+
+def test_dataset_tab_never_offers_auto_download(app, monkeypatch):
+    _mock_managed_dems(monkeypatch, ["flat.tif"])
+    app.run()
+    assert all(not o.startswith("⬇️") for o in app.tabs[0].selectbox[0].options)
+
+
+def test_toml_boolean_secrets_are_mirrored_into_the_environment(app, monkeypatch):
+    import os
+
+    monkeypatch.delenv("TALUS_TEST_BOOL_SECRET", raising=False)
+    monkeypatch.delenv("TALUS_TEST_STR_SECRET", raising=False)
+    app.secrets["TALUS_TEST_BOOL_SECRET"] = True
+    app.secrets["TALUS_TEST_STR_SECRET"] = "value"
+    app.run()
+    try:
+        assert os.environ.get("TALUS_TEST_BOOL_SECRET") == "true"
+        assert os.environ.get("TALUS_TEST_STR_SECRET") == "value"
+    finally:
+        os.environ.pop("TALUS_TEST_BOOL_SECRET", None)
+        os.environ.pop("TALUS_TEST_STR_SECRET", None)
+
+
+def test_header_and_status_bar_render_without_network_access(app):
+    app.run()
+    assert not app.exception
+    page = " ".join(m.value for m in app.markdown)
+    assert "TALUS AI" in page and "Lunar Terrain Intelligence Agent" in page
+    for label in ("Gemini:", "NASA:", "DEM Cache:"):
+        assert label in page

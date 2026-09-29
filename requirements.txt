@@ -1,4 +1,7 @@
-# Streamlit Community Cloud dependency file (pip). Installs this project itself in editable
-# mode, which pulls in every dependency already declared in pyproject.toml -- kept as the
-# single source of truth so this file never drifts out of sync with it.
+# Streamlit Community Cloud dependency file (pip / uv). Installs this project itself in editable
+# mode, which pulls in every dependency declared in pyproject.toml -- kept as the single source
+# of truth so this file never drifts out of sync with it. If this install step is ever skipped,
+# app/streamlit_app.py falls back to importing terrain_agent from ./src.
+#
+# No packages.txt is needed: rasterio's manylinux wheels bundle GDAL and PROJ.
 -e .

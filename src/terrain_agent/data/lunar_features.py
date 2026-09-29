@@ -94,6 +94,55 @@ def find_feature(name: Any) -> Optional[dict[str, Any]]:
     return None
 
 
+def find_feature_in_text(text: Any) -> Optional[dict[str, Any]]:
+    """The gazetteer feature named anywhere in free text (e.g. a chat question), or ``None``.
+
+    Used when no language model is available to interpret the question. Matching is on whole
+    words of the feature's distinctive name ("shackleton", "malapert"), longest name first.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    words = f" {' '.join(_WORD_RE.findall(text.lower()[:2000]))} "
+    for feature in sorted(load_features(), key=lambda f: -len(_key(f["name"]))):
+        key = _key(feature["name"])
+        if key and f" {key} " in words:
+            return dict(feature)
+    return None
+
+
+def covering_circle(points: list[tuple[float, float]], margin_km: float = 1.0) -> tuple[float, float, float]:
+    """Centre and radius (km) of a circle covering every (lat, lon) point, plus a margin.
+
+    Used to request one NASA DEM covering a box, route or set of sites. The centre is the
+    normalised mean of the points' unit vectors; the radius is the largest great-circle
+    distance to it. Raises ``OversizedRequestError`` beyond the analysis radius limit.
+    """
+    import math
+
+    if not points:
+        raise ValueError("at least one point is required")
+    clean = [validate_lunar_coordinate(lat, lon) for lat, lon in points]
+    vectors = [
+        (math.cos(math.radians(la)) * math.cos(math.radians(lo)),
+         math.cos(math.radians(la)) * math.sin(math.radians(lo)),
+         math.sin(math.radians(la)))
+        for la, lo in clean
+    ]
+    sx, sy, sz = (sum(v[i] for v in vectors) for i in range(3))
+    norm = math.sqrt(sx * sx + sy * sy + sz * sz) or 1.0
+    cx, cy, cz = sx / norm, sy / norm, sz / norm
+    center_lat = math.degrees(math.asin(max(-1.0, min(1.0, cz))))
+    center_lon = math.degrees(math.atan2(cy, cx))
+    from terrain_agent.terrain.coordinates import LUNAR_RADIUS_METERS
+
+    radius_m = max(
+        LUNAR_RADIUS_METERS * math.acos(max(-1.0, min(1.0, v[0] * cx + v[1] * cy + v[2] * cz)))
+        for v in vectors
+    )
+    radius_km = validate_analysis_radius(radius_m / 1000.0 + margin_km)
+    return round(center_lat, 6), round(center_lon, 6), round(radius_km, 3)
+
+
 def analysis_bbox(lat: float, lon: float, radius_km: float) -> dict[str, Any]:
     """Latitude/longitude box enclosing a circle, in the -180..180 convention the terrain
     statistics tools take. A circle containing a pole spans every longitude."""
@@ -147,7 +196,9 @@ def resolve_feature(name: Any, radius_km: Any = None) -> dict[str, Any]:
 __all__ = [
     "GAZETTEER_SOURCE",
     "analysis_bbox",
+    "covering_circle",
     "find_feature",
+    "find_feature_in_text",
     "known_feature_names",
     "load_features",
     "resolve_feature",

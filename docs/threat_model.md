@@ -59,7 +59,7 @@ All external inputs—whether submitted by an interactive user or retrieved from
 ### 2.3 Repudiation
 - **Threat**: Lack of auditability in critical safety analyses or disputes over tool parameters.
 - **Mitigations**:
-  - Deterministic execution logging via `loguru`.
+  - Deterministic execution logging via Python's standard `logging` module.
   - Every tool execution logs: timestamp, tool name, input parameters (sanitized of sensitive tokens), executed algorithm, computed metrics, and data source provenance hash.
 
 ### 2.4 Information Disclosure (Secret Leakage)

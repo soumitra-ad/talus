@@ -134,10 +134,11 @@ For example, when evaluating maximum slope:
 
 1. On [share.streamlit.io](https://share.streamlit.io), click **Create app** and pick this
    GitHub repository.
-2. **Branch**: `main` (or whichever branch you want live). **Main file path**:
-   `app/streamlit_app.py`.
+2. **Branch**: `master` (this repository has no `main` branch). **Main file path**:
+   `app/streamlit_app.py`. Under **Advanced settings**, choose **Python 3.12**.
 3. Dependencies are read from the root [`requirements.txt`](requirements.txt) (which installs
-   this project, pulling in everything declared in `pyproject.toml`) — no extra setup needed.
+   this project, pulling in everything declared in `pyproject.toml`) — no extra setup needed,
+   and no `packages.txt` (rasterio's wheels bundle GDAL).
 4. Under **Advanced settings → Secrets**, paste the keys you want from
    [`.streamlit/secrets.toml.example`](.streamlit/secrets.toml.example) (TOML format). Every
    key is optional; with none set, TALUS runs in offline deterministic demo mode. To enable
@@ -148,6 +149,9 @@ For example, when evaluating maximum slope:
    ```
 5. Click **Deploy**. Never commit a real `secrets.toml` — it's git-ignored, and secrets only
    ever live in the Streamlit Cloud Secrets box.
+
+See [docs/streamlit_cloud_deployment.md](docs/streamlit_cloud_deployment.md) for the exact
+settings, how to read the Cloud logs behind "Oh no. Error running app", and a release checklist.
 
 For deploying TALUS to Google Cloud Run instead (container build, Secret Manager, dedicated
 least-privilege service identity, resource limits, health checks, and a post-deploy smoke

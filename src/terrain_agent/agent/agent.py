@@ -1227,6 +1227,13 @@ GEMINI_TIMEOUT_S = 90.0
 #: an analysis whose deterministic tools had already succeeded.
 GEMINI_RETRY_ATTEMPTS = 3
 GEMINI_RETRY_MAX_DELAY_S = 8.0
+#: 429 is deliberately not retried: on the free tier it almost always means the *daily* quota
+#: is gone, and retrying only adds delay before the deterministic fallback.
+GEMINI_RETRY_STATUS_CODES = (408, 500, 502, 503, 504)
+#: After a quota/auth failure, skip Gemini for this long and answer deterministically, instead
+#: of spending seconds on a call that is certain to fail again.
+GEMINI_COOLDOWN_S = {"quota_daily": 1800.0, "rate_limited": 60.0, "auth": 600.0, "model_not_found": 600.0}
+QUOTA_DAILY_MESSAGE = "Gemini daily quota reached. Terrain tools still available."
 
 
 def _gemini_http_options(timeout_s: float = GEMINI_TIMEOUT_S, attempts: int = GEMINI_RETRY_ATTEMPTS) -> Any:
@@ -1235,7 +1242,8 @@ def _gemini_http_options(timeout_s: float = GEMINI_TIMEOUT_S, attempts: int = GE
     return _genai_types.HttpOptions(
         timeout=int(timeout_s * 1000),
         retry_options=_genai_types.HttpRetryOptions(
-            attempts=attempts, initial_delay=1.0, max_delay=GEMINI_RETRY_MAX_DELAY_S
+            attempts=attempts, initial_delay=1.0, max_delay=GEMINI_RETRY_MAX_DELAY_S,
+            http_status_codes=list(GEMINI_RETRY_STATUS_CODES),
         ),
     )
 
@@ -1250,7 +1258,11 @@ def classify_model_error(exc: BaseException) -> tuple[str, str]:
         code = getattr(exc, "status_code", None)
     name = type(exc).__name__.lower()
     if code == 429:
-        return "rate_limited", "Gemini's rate limit or quota was reached. Please wait a minute and retry the analysis."
+        # The free tier's binding limit is per day (quotaId ...PerDay...); retrying cannot help
+        # until it resets, so it is reported distinctly from a short per-minute rate limit.
+        if "perday" in str(exc).lower().replace("_", "").replace("-", ""):
+            return "quota_daily", QUOTA_DAILY_MESSAGE
+        return "rate_limited", "Gemini's rate limit was reached. Please wait a minute and retry the analysis."
     if code in (401, 403):
         return "auth", "Gemini rejected the configured credentials. The operator must check GEMINI_API_KEY."
     if code == 404:
@@ -1388,6 +1400,7 @@ class TALUSAgent:
             max_requests_per_minute or settings.agent.max_requests_per_minute
         )
         self._client: Any | None = client
+        self._model_blocked: dict[str, Any] | None = None
 
         if self._client is None and (api_key or vertex_project_id):
             self._init_client()
@@ -1415,6 +1428,27 @@ class TALUSAgent:
     def is_live(self) -> bool:
         """True if connected to a (real or injected) model client."""
         return self._client is not None
+
+    @property
+    def model_block(self) -> dict[str, Any] | None:
+        """``{"category", "message"}`` while Gemini is being skipped after a quota/auth
+        failure, else ``None``. Safe for display: fixed text only."""
+        block = self._model_blocked
+        if block is None or time.monotonic() >= block["until"]:
+            self._model_blocked = None
+            return None
+        return {"category": block["category"], "message": block["message"]}
+
+    def _fallback(
+        self, user_message: str, max_slope_deg: float, notice: str,
+        emit: Callable[[str, dict[str, Any]], None],
+    ) -> dict[str, Any]:
+        from terrain_agent.agent.fallback import deterministic_analysis
+
+        return deterministic_analysis(
+            user_message, max_slope_deg=max_slope_deg, notice=notice,
+            dem_cache_dir=self.dem_cache_dir, emit=emit,
+        )
 
     def chat(
         self,
@@ -1476,8 +1510,24 @@ class TALUSAgent:
                 "is_demo": False,
             }
 
+        emit = _safe_emitter(on_event)
         if not self.is_live:
+            # No model configured: still answer a question about a named place with the
+            # deterministic NASA DEM pipeline, rather than only describing capabilities.
+            fallback = self._fallback(
+                user_message, max_slope_deg,
+                "Gemini is not configured (demo mode). Terrain tools still available.", emit,
+            )
+            if fallback["status"] == "fallback":
+                fallback["is_demo"] = True
+                return fallback
             return self._demo_response(user_message, max_slope_deg)
+
+        blocked = self.model_block
+        if blocked is not None:
+            fallback = self._fallback(user_message, max_slope_deg, blocked["message"], emit)
+            fallback["error_category"] = blocked["category"]
+            return fallback
 
         max_history = settings.agent.max_history_messages
         bounded_history = _normalize_history(history)[-max_history:] if max_history > 0 else []
@@ -1488,7 +1538,6 @@ class TALUSAgent:
         # Created here, not inside the loop, so tool results already computed survive a model
         # failure later in the turn and are still shown to the user.
         tool_calls_made: list[dict[str, Any]] = []
-        emit = _safe_emitter(on_event)
         try:
             return self._gemini_response(
                 user_message, bounded_history, max_slope_deg, tool_calls_made, emit
@@ -1499,6 +1548,18 @@ class TALUSAgent:
                 "Agent turn failed: error_category=%s exception=%s tool_calls_completed=%d",
                 category, type(exc).__name__, len(tool_calls_made),
             )
+            cooldown = GEMINI_COOLDOWN_S.get(category)
+            if cooldown:
+                self._model_blocked = {
+                    "until": time.monotonic() + cooldown, "category": category, "message": message,
+                }
+            # Gemini failed: answer deterministically from NASA DEM data when the question
+            # names a known place, instead of stopping at an error.
+            fallback = self._fallback(user_message, max_slope_deg, message, emit)
+            if fallback["status"] == "fallback":
+                fallback["error_category"] = category
+                return fallback
+            message = fallback["text"]  # the error plus what can still be done without Gemini
             if tool_calls_made:
                 message += (
                     " The deterministic tool results completed before the interruption are "
