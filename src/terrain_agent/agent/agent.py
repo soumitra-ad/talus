@@ -18,11 +18,13 @@ autonomous spacecraft control, or guaranteed rover safety.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import threading
 import time
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
@@ -113,10 +115,22 @@ MANDATORY RULES YOU MUST NEVER VIOLATE:
 2. You MUST ALWAYS cite the data source and resolution from tool results.
 3. You MUST ALWAYS include this disclaimer when reporting safety results:
    "Configured analysis threshold: {X}°. This is NOT a certified safety limit."
-4. You MUST use ONLY the statuses PASS, REVIEW_REQUIRED, or FAIL for safety.
+4. You MUST use ONLY the statuses PASS, REVIEW_REQUIRED, or FAIL for safety, and ONLY when a
+   tool result contains that exact status (overall_status, or a site/segment status). Never
+   assign a status to an area yourself; for area questions report the tool's outcome and
+   measured values instead. Quote tool numbers; do not derive new ones (no complements,
+   sums, or unit conversions).
 5. You MUST clearly state when data is unavailable or coverage is missing.
 6. You MUST NEVER claim this system is certified for operational use.
 7. You MUST distinguish between measured/calculated values and interpretation.
+
+WORKFLOW FOR A NAMED PLACE (e.g. "around Shackleton Crater"):
+1. resolve_lunar_feature(name) -> centre and analysis_area. Never supply coordinates for a
+   named feature from memory.
+2. fetch_nasa_dem(lat, lon, radius_km) with the resolved centre and radius -> dem_path.
+3. The requested statistics tool with that dem_path and the analysis_area bounds unchanged.
+4. Explain the tool results briefly, citing mission, instrument, product id and resolution.
+If any step fails, stop and say plainly which step failed and why; do not substitute values.
 
 RESPONSE STYLE:
 - Be precise and scientific, but accessible.
@@ -143,6 +157,31 @@ UNTRUSTED CONTENT:
 # ---------------------------------------------------------------------------
 
 TALUS_TOOL_DECLARATIONS: list[dict[str, Any]] = [
+    {
+        "name": "resolve_lunar_feature",
+        "description": (
+            "Resolve a named lunar feature (for example 'Shackleton Crater') to its centre "
+            "coordinates and a deterministic analysis bounding box, from the TALUS curated "
+            "gazetteer. ALWAYS use this instead of recalling coordinates yourself. Pass the "
+            "returned analysis_area bounds unchanged to the statistics tools, and its centre and "
+            "radius_km to fetch_nasa_dem. If the feature is not found, ask the user for "
+            "coordinates; never guess them."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Feature name as the user wrote it."},
+                "radius_km": {
+                    "type": "number",
+                    "description": (
+                        "Radius of the area of interest in km (at most 50). Omit to use half "
+                        "the feature's recorded diameter."
+                    ),
+                },
+            },
+            "required": ["name"],
+        },
+    },
     {
         "name": "search_dem_products",
         "description": (
@@ -528,6 +567,7 @@ def dispatch_tool_call(
         }
 
     handlers = {
+        "resolve_lunar_feature": lambda: _tool_resolve_lunar_feature(tool_args, _DISCLAIMER),
         "search_dem_products": lambda: _tool_search_dem_products(tool_args, _DISCLAIMER),
         "get_elevation_stats": lambda: _tool_terrain_stats(
             tool_args, _DISCLAIMER, dem_cache_dir, "elevation"
@@ -555,7 +595,9 @@ def dispatch_tool_call(
     if handler is None:
         return {
             "status": "error",
-            "error": f"Unknown tool: {tool_name!r}",
+            "error_type": "UnknownTool",
+            "error": f"Unknown tool: {str(tool_name)[:60]!r}",
+            "tool": tool_name,
             "disclaimer": _DISCLAIMER,
         }
 
@@ -563,6 +605,7 @@ def dispatch_tool_call(
     started = time.monotonic()
     try:
         result = handler()
+        result.setdefault("tool", tool_name)
         _log_tool_call(request_id, tool_name, result, time.monotonic() - started)
         return result
     except TerrainAnalysisError as exc:
@@ -636,6 +679,14 @@ def _log_tool_call(request_id: str, tool_name: str, result: dict[str, Any], dura
 # ---------------------------------------------------------------------------
 # Individual tool implementations
 # ---------------------------------------------------------------------------
+
+
+def _tool_resolve_lunar_feature(args: dict[str, Any], disclaimer: str) -> dict[str, Any]:
+    from terrain_agent.data.lunar_features import resolve_feature
+
+    result = resolve_feature(args["name"], args.get("radius_km"))
+    result["disclaimer"] = disclaimer
+    return result
 
 
 def _tool_search_dem_products(
@@ -979,6 +1030,12 @@ def summarize_tool_call(tool_name: str, args: dict[str, Any], result: dict[str, 
     if status == "rate_limited":
         return f"The {tool_name} tool was rate-limited: {result.get('error', 'too many requests')}"
 
+    if tool_name == "resolve_lunar_feature":
+        if status == "ok":
+            feature = result.get("feature") or {}
+            return f"Resolved {feature.get('name')} from the TALUS gazetteer."
+        return "The named feature is not in the TALUS gazetteer; its coordinates are unknown."
+
     if tool_name == "search_dem_products":
         count = result.get("count", 0)
         return (
@@ -1069,6 +1126,47 @@ _MANDATORY_DISCLAIMER = (
 )
 
 
+_SAFETY_STATUSES = ("PASS", "REVIEW_REQUIRED", "FAIL")
+_STATUS_TOKEN_RE = re.compile(r"\b(PASS|REVIEW_REQUIRED|FAIL)\b")
+
+
+def _grounded_statuses(value: Any, found: set[str] | None = None, depth: int = 0) -> set[str]:
+    """Every PASS / REVIEW_REQUIRED / FAIL value present in structured tool results."""
+    found = set() if found is None else found
+    if depth > 8:
+        return found
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in ("status", "overall_status") and item in _SAFETY_STATUSES:
+                found.add(item)
+            else:
+                _grounded_statuses(item, found, depth + 1)
+    elif isinstance(value, list):
+        for item in value[:500]:
+            _grounded_statuses(item, found, depth + 1)
+    return found
+
+
+def _ensure_status_grounding(text: str, tool_calls: list[dict[str, Any]]) -> str:
+    """Flag any safety status in the model text that no deterministic tool produced.
+
+    Safety statuses must originate from the terrain engine (AGENTS.md §1, §4). The prompt
+    forbids the model from assigning one itself; this is the code-level backstop.
+    """
+    mentioned = set(_STATUS_TOKEN_RE.findall(text or ""))
+    if not mentioned:
+        return text
+    grounded = _grounded_statuses([c.get("result") for c in tool_calls])
+    ungrounded = sorted(mentioned - grounded)
+    if not ungrounded:
+        return text
+    return (
+        f"{text}\n\n> **Note from TALUS:** the label(s) {', '.join(ungrounded)} above were not "
+        "produced by a deterministic TALUS safety evaluation in this analysis and are not a "
+        "TALUS safety result. Only the measured values and tool outcomes shown are grounded."
+    )
+
+
 def _ensure_disclaimer(text: str | None) -> str:
     text = text or ""
     lowered = text.lower()
@@ -1078,6 +1176,159 @@ def _ensure_disclaimer(text: str | None) -> str:
         return text
     separator = "\n\n" if text.strip() else ""
     return f"{text}{separator}{_MANDATORY_DISCLAIMER}"
+
+
+# ---------------------------------------------------------------------------
+# Conversation history
+#
+# UIs conventionally label replies "assistant", but the Gemini chat API accepts only "user"
+# and "model" and raises ``ValueError: Role must be user or model`` for anything else -- which
+# made every follow-up question in a Streamlit conversation fail. History is normalised here,
+# at the single entry point, so no caller can reintroduce that failure.
+# ---------------------------------------------------------------------------
+
+_ROLE_ALIASES = {"user": "user", "model": "model", "assistant": "model"}
+
+
+def _normalize_history(history: Any) -> list[dict[str, Any]]:
+    """Convert prior turns to Gemini ``{"role": "user"|"model", "parts": [{"text": ...}]}``.
+
+    Accepts ``{"role", "parts"}`` or ``{"role", "content"}`` entries. Unknown roles, non-dict
+    entries and turns with no text are dropped rather than sent.
+    """
+    normalized: list[dict[str, Any]] = []
+    if not isinstance(history, list):
+        return normalized
+    for turn in history:
+        if not isinstance(turn, dict):
+            continue
+        role = _ROLE_ALIASES.get(str(turn.get("role", "")).lower())
+        if role is None:
+            continue
+        if "parts" in turn and isinstance(turn["parts"], list):
+            texts = [p.get("text") for p in turn["parts"] if isinstance(p, dict)]
+        else:
+            texts = [turn.get("content")]
+        text = "\n".join(t for t in texts if isinstance(t, str) and t.strip())
+        if text:
+            normalized.append({"role": role, "parts": [{"text": text}]})
+    return normalized
+
+
+# ---------------------------------------------------------------------------
+# Model-call plumbing: timeouts, error classification, health check
+# ---------------------------------------------------------------------------
+
+#: Per-request HTTP timeout for Gemini calls. Without one a stalled request would hold the
+#: Streamlit script (and the user) indefinitely.
+GEMINI_TIMEOUT_S = 90.0
+#: Bounded retries for transient Gemini failures (408/429/5xx, transport errors). The SDK does
+#: not retry at all unless retry options are given; a single 503 mid-turn would otherwise end
+#: an analysis whose deterministic tools had already succeeded.
+GEMINI_RETRY_ATTEMPTS = 3
+GEMINI_RETRY_MAX_DELAY_S = 8.0
+
+
+def _gemini_http_options(timeout_s: float = GEMINI_TIMEOUT_S, attempts: int = GEMINI_RETRY_ATTEMPTS) -> Any:
+    if _genai_types is None:  # pragma: no cover - google-genai is a declared dependency
+        return None
+    return _genai_types.HttpOptions(
+        timeout=int(timeout_s * 1000),
+        retry_options=_genai_types.HttpRetryOptions(
+            attempts=attempts, initial_delay=1.0, max_delay=GEMINI_RETRY_MAX_DELAY_S
+        ),
+    )
+
+
+def classify_model_error(exc: BaseException) -> tuple[str, str]:
+    """Map a Gemini/transport exception to ``(category, user-facing message)``.
+
+    Messages are fixed text: never the exception string, which may carry request details.
+    """
+    code = getattr(exc, "code", None)
+    if not isinstance(code, int):
+        code = getattr(exc, "status_code", None)
+    name = type(exc).__name__.lower()
+    if code == 429:
+        return "rate_limited", "Gemini's rate limit or quota was reached. Please wait a minute and retry the analysis."
+    if code in (401, 403):
+        return "auth", "Gemini rejected the configured credentials. The operator must check GEMINI_API_KEY."
+    if code == 404:
+        return "model_not_found", "The configured Gemini model is not available. The operator must check GEMINI_MODEL."
+    if code == 400:
+        return "bad_request", "Gemini could not process this request. Please rephrase the question and retry."
+    if isinstance(exc, TimeoutError) or "timeout" in name:
+        return "timeout", "Gemini did not respond in time. Please retry the analysis."
+    return "unavailable", "Gemini service is currently unavailable. Please retry the analysis."
+
+
+def check_gemini_health(
+    api_key: str | None = None,
+    model_name: str | None = None,
+    *,
+    client: Any | None = None,
+    timeout_s: float = 20.0,
+) -> dict[str, Any]:
+    """Make the smallest possible Gemini call and report the outcome.
+
+    The report contains only booleans, the model name, latency and a safe error category --
+    never the API key or any exception text.
+    """
+    from terrain_agent.config import settings
+
+    api_key = api_key if api_key is not None else settings.model.api_key
+    model_name = model_name or settings.model.model_name
+    report: dict[str, Any] = {
+        "configured": bool(api_key) or client is not None,
+        "model_configured": bool(model_name),
+        "model": model_name,
+        "request": "SKIPPED",
+        "response_received": False,
+        "latency_s": None,
+        "error_category": None,
+    }
+    if not report["configured"]:
+        report["error_category"] = "not_configured"
+        return report
+    if client is None:
+        if _genai is None:  # pragma: no cover
+            report.update(request="FAIL", error_category="sdk_missing")
+            return report
+        client = _genai.Client(api_key=api_key, http_options=_gemini_http_options(timeout_s, attempts=1))
+    started = time.monotonic()
+    try:
+        response = client.models.generate_content(model=model_name, contents="Reply with the single word OK.")
+        text = getattr(response, "text", None)
+        report["response_received"] = bool(isinstance(text, str) and text.strip())
+        report["request"] = "SUCCESS" if report["response_received"] else "FAIL"
+        if not report["response_received"]:
+            report["error_category"] = "empty_response"
+    except Exception as exc:  # noqa: BLE001
+        report["request"] = "FAIL"
+        report["error_category"] = classify_model_error(exc)[0]
+    report["latency_s"] = round(time.monotonic() - started, 2)
+    return report
+
+
+def _safe_emitter(on_event: Callable[[str, dict[str, Any]], None] | None) -> Callable[[str, dict[str, Any]], None]:
+    """Wrap a UI progress callback so a rendering error can never break an agent turn."""
+
+    def emit(kind: str, info: dict[str, Any]) -> None:
+        if on_event is None:
+            return
+        try:
+            on_event(kind, info)
+        except Exception:  # noqa: BLE001
+            log.warning("Agent progress callback failed for event %s", kind, exc_info=True)
+
+    return emit
+
+
+def _call_key(tool_name: str, tool_args: dict[str, Any]) -> str:
+    try:
+        return tool_name + ":" + json.dumps(tool_args, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return tool_name + ":" + repr(sorted(tool_args.items(), key=lambda kv: str(kv[0])))
 
 
 # ---------------------------------------------------------------------------
@@ -1147,12 +1398,14 @@ class TALUSAgent:
             log.warning("google-genai is not installed — running in demo mode.")
             return
         try:
+            http_options = _gemini_http_options()
             if self.vertex_project_id:
                 self._client = _genai.Client(
-                    vertexai=True, project=self.vertex_project_id, location=self.vertex_location
+                    vertexai=True, project=self.vertex_project_id, location=self.vertex_location,
+                    http_options=http_options,
                 )
             else:
-                self._client = _genai.Client(api_key=self.api_key)
+                self._client = _genai.Client(api_key=self.api_key, http_options=http_options)
             log.info("Gemini client initialised: model=%s", self.model_name)
         except Exception:  # noqa: BLE001
             log.exception("Failed to initialise the Gemini client — running in demo mode.")
@@ -1168,6 +1421,7 @@ class TALUSAgent:
         user_message: str,
         history: list[dict[str, Any]] | None = None,
         max_slope_deg: float = 15.0,
+        on_event: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """
         Process a user message and return a structured response.
@@ -1177,9 +1431,15 @@ class TALUSAgent:
         user_message:
             The user's natural-language terrain query.
         history:
-            Prior conversation turns (list of {role, parts} dicts).
+            Prior conversation turns (list of {role, parts} or {role, content} dicts; the
+            "assistant" role is accepted and sent to Gemini as "model").
         max_slope_deg:
             Currently configured slope threshold from the UI.
+        on_event:
+            Optional progress callback ``on_event(kind, info)`` for a UI activity trace. Kinds:
+            ``"model"`` (info: ``phase``), ``"tool_start"`` (``tool``) and ``"tool_end"``
+            (``tool``, ``status``, ``summary``). Only observable actions are reported, never
+            model reasoning. Exceptions raised by the callback are logged and ignored.
 
         Returns
         -------
@@ -1220,19 +1480,35 @@ class TALUSAgent:
             return self._demo_response(user_message, max_slope_deg)
 
         max_history = settings.agent.max_history_messages
-        bounded_history = (history or [])[-max_history:] if max_history > 0 else []
+        bounded_history = _normalize_history(history)[-max_history:] if max_history > 0 else []
+        # A bounded slice can start mid-conversation; Gemini history should open with a user turn.
+        while bounded_history and bounded_history[0]["role"] != "user":
+            bounded_history.pop(0)
 
+        # Created here, not inside the loop, so tool results already computed survive a model
+        # failure later in the turn and are still shown to the user.
+        tool_calls_made: list[dict[str, Any]] = []
+        emit = _safe_emitter(on_event)
         try:
-            return self._gemini_response(user_message, bounded_history, max_slope_deg)
-        except Exception:  # noqa: BLE001 - the model/transport layer can fail in many ways
-            log.exception("Agent turn failed")
+            return self._gemini_response(
+                user_message, bounded_history, max_slope_deg, tool_calls_made, emit
+            )
+        except Exception as exc:  # noqa: BLE001 - the model/transport layer can fail in many ways
+            category, message = classify_model_error(exc)
+            log.error(
+                "Agent turn failed: error_category=%s exception=%s tool_calls_completed=%d",
+                category, type(exc).__name__, len(tool_calls_made),
+            )
+            if tool_calls_made:
+                message += (
+                    " The deterministic tool results completed before the interruption are "
+                    "shown below; no values were generated by the language model."
+                )
             return {
                 "status": "model_error",
-                "text": (
-                    "The AI analysis service is temporarily unavailable. Please try again in a "
-                    "moment, or ask a more specific question."
-                ),
-                "tool_calls": [],
+                "error_category": category,
+                "text": message,
+                "tool_calls": tool_calls_made,
                 "is_demo": False,
             }
 
@@ -1241,6 +1517,8 @@ class TALUSAgent:
         user_message: str,
         history: list[dict[str, Any]],
         max_slope_deg: float,
+        tool_calls_made: list[dict[str, Any]] | None = None,
+        emit: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Execute a bounded agentic loop: interpret intent, call tools, explain results.
 
@@ -1275,8 +1553,14 @@ class TALUSAgent:
             f"User request:\n{user_message}"
         )
 
-        tool_calls_made: list[dict[str, Any]] = []
+        if tool_calls_made is None:
+            tool_calls_made = []
+        emit = emit or (lambda kind, info: None)
+        # Identical tool calls within one turn are executed once and the result reused, so a
+        # model that repeats itself cannot trigger repeated NASA searches or downloads.
+        results_this_turn: dict[str, dict[str, Any]] = {}
         text: str | None = None
+        emit("model", {"phase": "interpreting"})
         response = chat_session.send_message(prompt)
         tool_call_cap_hit = False
 
@@ -1295,16 +1579,24 @@ class TALUSAgent:
                     tool_call_cap_hit = True
                     break
 
-                tool_name = fn_call.name
+                tool_name = str(fn_call.name or "")
                 tool_args = dict(fn_call.args or {})
                 log.info("Executing tool: %s args=%s", tool_name, sorted(tool_args.keys()))
 
-                result = dispatch_tool_call(tool_name, tool_args, dem_cache_dir=self.dem_cache_dir)
+                call_key = _call_key(tool_name, tool_args)
+                emit("tool_start", {"tool": tool_name})
+                if call_key in results_this_turn:
+                    result = results_this_turn[call_key]
+                else:
+                    result = dispatch_tool_call(tool_name, tool_args, dem_cache_dir=self.dem_cache_dir)
+                    results_this_turn[call_key] = result
+                summary = summarize_tool_call(tool_name, tool_args, result)
+                emit("tool_end", {"tool": tool_name, "status": result.get("status"), "summary": summary})
                 tool_calls_made.append(
                     {
                         "tool": tool_name,
                         "result_status": result.get("status"),
-                        "summary": summarize_tool_call(tool_name, tool_args, result),
+                        "summary": summary,
                         # The full structured result, so a UI can render dedicated panels
                         # (status badges, metric cards, provenance, map coordinates) straight
                         # from backend data -- never by parsing the model's prose.
@@ -1328,6 +1620,7 @@ class TALUSAgent:
                 )
                 break
 
+            emit("model", {"phase": "explaining"})
             response = chat_session.send_message(response_parts)
         else:
             text = (
@@ -1336,9 +1629,24 @@ class TALUSAgent:
                 "request into smaller steps."
             )
 
+        status = "ok"
+        if not (isinstance(text, str) and text.strip()):
+            # The model returned neither a tool call nor text (e.g. a blocked or empty
+            # candidate). Report that honestly and fall back to the deterministic summaries.
+            log.warning("Model returned an empty final response (tool_calls=%d).", len(tool_calls_made))
+            if tool_calls_made:
+                text = (
+                    "The language model did not return an explanation for this turn. The "
+                    "deterministic tool results are listed below:\n\n"
+                    + "\n".join(f"- {c['summary']}" for c in tool_calls_made)
+                )
+            else:
+                status = "model_error"
+                text = "Gemini returned an empty response. Please retry the analysis."
+
         return {
-            "status": "ok",
-            "text": _ensure_disclaimer(text),
+            "status": status,
+            "text": _ensure_disclaimer(_ensure_status_grounding(text, tool_calls_made)),
             "tool_calls": tool_calls_made,
             "is_demo": False,
         }

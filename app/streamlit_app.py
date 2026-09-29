@@ -11,13 +11,15 @@ structured backend result for each tool it ran. Status badges are drawn only fro
 structured ``status`` / ``overall_status`` enum fields on those results -- never parsed out of
 response text (see ``ui_helpers.status_badge_html``).
 
-Panels:
-- Sidebar: mission parameters & status
-- Chat: natural language terrain queries (Phase 6 agent)
-- Results: structured panels for whatever tools the last chat turn ran
-- Direct Structured Analysis: coordinate/region forms that call the deterministic tools
-  directly, without needing a live model
-- Schematic map: requested region / DEM coverage / safe regions / rover route / landing sites
+Layout (chat first, usable on small screens):
+- Header and a status bar (Gemini / NASA ODE / DEM engine)
+- Agent conversation: each answer carries an observable activity trace, result cards built
+  from structured tool output, and an evidence panel (dataset provenance, coordinates, method)
+- Direct Structured Analysis: forms that call the deterministic tools directly, no model
+- Sidebar: mission parameters, Gemini health check, conversation controls
+
+No external service is contacted at startup: Gemini and NASA are only called when the user
+asks for something, so the UI loads even if either is unavailable.
 
 Research/Demo Disclaimer
 ------------------------
@@ -37,11 +39,16 @@ from typing import Any
 import streamlit as st
 
 from ui_helpers import (
+    TOOL_LABELS,
+    analysis_outcome,
     build_terrain_map_figure,
+    build_trace,
     fmt,
     fmt_pct,
     friendly_error_message,
     list_managed_dems,
+    nasa_status_from_tool_calls,
+    sanitize_model_markdown,
     status_badge_html,
 )
 
@@ -68,8 +75,8 @@ except Exception:
 st.set_page_config(
     page_title="TALUS — Lunar Terrain Analysis",
     page_icon="🌕",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    layout="centered",
+    initial_sidebar_state="auto",
     menu_items={
         "About": (
             "**TALUS** — Terrain Analysis for Landing and Uncrewed Systems\n\n"
@@ -79,40 +86,23 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Custom CSS
+# Minimal CSS: status pills, badges, disclaimer. No background images or animations.
 # ---------------------------------------------------------------------------
 
 st.markdown(
     """
 <style>
-[data-testid="stAppViewContainer"] {
-    background: linear-gradient(135deg, #0d0d1a 0%, #111827 50%, #0a0f1e 100%);
-    color: #e2e8f0;
-}
-[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #111827 0%, #0d1626 100%);
-    border-right: 1px solid #1e3a5f;
-}
-.user-bubble {
-    background: linear-gradient(135deg, #1e40af, #1d4ed8);
-    border-radius: 18px 18px 4px 18px;
-    padding: 12px 16px; margin: 8px 0; max-width: 85%; margin-left: auto;
-    color: #fff; font-size: 0.95rem; box-shadow: 0 2px 12px rgba(30, 64, 175, 0.4);
-}
-.assistant-bubble {
-    background: linear-gradient(135deg, #1a2744, #1e3a5f);
-    border-radius: 18px 18px 18px 4px;
-    padding: 12px 16px; margin: 8px 0; max-width: 95%;
-    color: #cbd5e1; font-size: 0.95rem; border-left: 3px solid #3b82f6;
-    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
-}
+.talus-sub { color:#94a3b8; font-size:0.9rem; margin-top:-0.6rem; }
+.status-bar { display:flex; flex-wrap:wrap; gap:6px; margin:6px 0 10px 0; }
+.pill { border:1px solid #334155; border-radius:999px; padding:2px 10px; font-size:0.78rem; color:#cbd5e1; white-space:nowrap; }
+.dot-ok { color:#22c55e; } .dot-warn { color:#f59e0b; } .dot-err { color:#ef4444; } .dot-idle { color:#64748b; }
 .badge-pass { background: #166534; color: #86efac; padding: 3px 10px; border-radius: 20px; font-weight: 700; font-size: 0.8rem; }
 .badge-review { background: #78350f; color: #fde68a; padding: 3px 10px; border-radius: 20px; font-weight: 700; font-size: 0.8rem; }
 .badge-fail { background: #7f1d1d; color: #fca5a5; padding: 3px 10px; border-radius: 20px; font-weight: 700; font-size: 0.8rem; }
 .section-divider { border-top: 1px solid #1e3a5f; margin: 16px 0; }
 .disclaimer {
     background: #1c1917; border: 1px solid #78350f; border-radius: 8px;
-    padding: 10px 14px; color: #d97706; font-size: 0.8rem;
+    padding: 8px 12px; color: #d97706; font-size: 0.78rem;
 }
 </style>
 """,
@@ -126,6 +116,10 @@ st.markdown(
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
+#: Conversation turns kept in session state. Older turns are dropped so a long session cannot
+#: grow memory without bound; each stored turn holds only small structured tool results.
+MAX_STORED_MESSAGES = 40
+
 
 # ---------------------------------------------------------------------------
 # Session-state helpers
@@ -135,8 +129,8 @@ log = logging.getLogger(__name__)
 def _init_session() -> None:
     defaults: dict[str, Any] = {
         "messages": [],
-        "tool_calls": [],
-        "last_result": None,
+        "nasa_status": "unknown",
+        "gemini_health": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -183,7 +177,7 @@ if not _check_access():
 
 
 # ---------------------------------------------------------------------------
-# Agent singleton
+# Agent singleton and cached tool calls
 # ---------------------------------------------------------------------------
 
 
@@ -226,22 +220,26 @@ try:
     _DEFAULT_SLOPE = settings.safety.default_max_slope_deg
     _GEMINI_KEY = settings.model.api_key
     _MODEL_NAME = settings.model.model_name
+    _NASA_DOWNLOADS = settings.nasa.downloads_enabled
 except Exception:
     log.exception("Failed to load configuration; using safe defaults")
     _APP_VERSION = "0.1.0"
     _DEFAULT_SLOPE = 15.0
     _GEMINI_KEY = None
     _MODEL_NAME = "gemini-3.6-flash"
+    _NASA_DOWNLOADS = False
+
+agent = _build_agent(_GEMINI_KEY, _MODEL_NAME)
+available_dems = _cached_managed_dems()
 
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# Sidebar: mission parameters and operator controls (collapsed by default on small screens)
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
     st.markdown("## 🌕 TALUS")
     st.caption(f"v{_APP_VERSION} · Research/Demo System")
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
 
     st.markdown("### ⚙️ Mission Parameters")
     max_slope = st.slider(
@@ -255,51 +253,94 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
     st.markdown("### 🗂️ Default DEM")
-    available_dems = _cached_managed_dems()
     if available_dems:
         default_dem = st.selectbox(
-            "DEM for the Direct Analysis tools below",
+            "DEM for the Direct Analysis tools",
             options=available_dems,
             help="Only DEMs already present in the managed cache/sample directories can be "
             "selected — never an arbitrary filesystem path.",
         )
     else:
         default_dem = None
-        st.info("No DEMs cached yet. Use the NASA DEM Search & Fetch tool below, or ask the "
-                "chat assistant to fetch one.")
+        st.info("No DEMs cached yet. Ask the agent about a place, or use the NASA DEM Search "
+                "tab, and a DEM will be fetched from NASA.")
 
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
     st.markdown("### 🤖 AI Status")
-    agent = _build_agent(_GEMINI_KEY, _MODEL_NAME)
     if agent is not None and getattr(agent, "is_live", False):
         st.success(f"Gemini Active ({_MODEL_NAME})")
     else:
         st.info("Demo Mode — set GEMINI_API_KEY for live AI analysis. "
-                "The Direct Analysis tools below work without one.")
+                "The Direct Analysis tools work without one.")
+    if st.button("Run Gemini health check", width="stretch"):
+        from terrain_agent.agent import check_gemini_health
+        with st.spinner("Contacting Gemini…"):
+            st.session_state.gemini_health = check_gemini_health(_GEMINI_KEY, _MODEL_NAME)
+    health = st.session_state.gemini_health
+    if health:
+        st.caption(
+            f"Configured: {'YES' if health['configured'] else 'NO'} · "
+            f"Request: {health['request']} · "
+            f"Latency: {fmt(health['latency_s'], ' s')}"
+            + (f" · Error: {health['error_category']}" if health.get("error_category") else "")
+        )
 
-    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
     if st.button("🗑️ Clear Conversation", width="stretch"):
         st.session_state.messages = []
-        st.session_state.tool_calls = []
-        st.session_state.last_result = None
         st.rerun()
 
+    if not os.environ.get("TALUS_ACCESS_TOKEN"):
+        st.markdown(
+            '<div class="disclaimer">🔓 No access token is configured (TALUS_ACCESS_TOKEN unset). '
+            "This deployment has no authentication. Do not expose it on a public network without "
+            "one — an unguessable URL is not a security control.</div>",
+            unsafe_allow_html=True,
+        )
+
 
 # ---------------------------------------------------------------------------
-# Header
+# Header and status bar
 # ---------------------------------------------------------------------------
 
+st.markdown("# 🌕 TALUS")
 st.markdown(
-    """
-<h1 style='font-size:1.8rem; font-weight:700; margin-bottom:0;'>
-🌕 Terrain Analysis for Landing and Uncrewed Systems
-</h1>
-<p style='color:#94a3b8; font-size:0.85rem; margin-top:4px;'>
-Research & Demo System · NASA Lunar Terrain Analysis
-</p>
-""",
+    '<div class="talus-sub"><strong>Lunar Terrain Analysis Agent</strong> · '
+    "AI-assisted terrain intelligence for lunar landing and rover operations</div>",
+    unsafe_allow_html=True,
+)
+
+
+def _pill(label: str, state: str, dot: str) -> str:
+    return f'<span class="pill">{html.escape(label)}: <span class="{dot}">●</span> {html.escape(state)}</span>'
+
+
+_gemini_live = agent is not None and getattr(agent, "is_live", False)
+_health = st.session_state.gemini_health
+if _gemini_live and _health and _health.get("request") == "FAIL":
+    gemini_pill = _pill("Gemini", "Error", "dot-err")
+elif _gemini_live:
+    gemini_pill = _pill("Gemini", "Active", "dot-ok")
+else:
+    gemini_pill = _pill("Gemini", "Demo mode", "dot-warn")
+
+_nasa_states = {
+    "unknown": ("Not yet contacted", "dot-idle"),
+    "connected": ("Connected", "dot-ok"),
+    "error": ("Error", "dot-err"),
+    "disabled": ("Downloads disabled", "dot-warn"),
+}
+if not _NASA_DOWNLOADS and st.session_state.nasa_status == "unknown":
+    nasa_state, nasa_dot = _nasa_states["disabled"]
+else:
+    nasa_state, nasa_dot = _nasa_states.get(st.session_state.nasa_status, _nasa_states["unknown"])
+
+dem_state = f"Ready · {len(available_dems)} cached" if available_dems else "Ready · none cached"
+st.markdown(
+    '<div class="status-bar">'
+    + gemini_pill
+    + _pill("NASA ODE", nasa_state, nasa_dot)
+    + _pill("DEM Engine", dem_state, "dot-ok")
+    + "</div>",
     unsafe_allow_html=True,
 )
 st.markdown(
@@ -308,14 +349,6 @@ st.markdown(
     "autonomous spacecraft control, or guaranteed rover safety.</div>",
     unsafe_allow_html=True,
 )
-if not os.environ.get("TALUS_ACCESS_TOKEN"):
-    st.markdown(
-        '<div class="disclaimer">🔓 No access token is configured (TALUS_ACCESS_TOKEN unset). '
-        "This deployment has no authentication. Do not expose it on a public network without "
-        "one — an unguessable URL is not a security control.</div>",
-        unsafe_allow_html=True,
-    )
-st.markdown("")
 
 
 # ---------------------------------------------------------------------------
@@ -324,11 +357,12 @@ st.markdown("")
 # Each panel is built only from typed fields of a dispatch_tool_call result -- never from
 # response prose. Free-text values that originate outside this process (site ids the user
 # typed, NASA product descriptions) are shown with st.write/st.dataframe, never interpolated
-# into raw HTML.
+# into raw HTML. ``nested=True`` renders without inner expanders (Streamlit forbids nesting),
+# for use inside a chat message's evidence expander.
 # ---------------------------------------------------------------------------
 
 
-def _render_rover_panel(result: dict[str, Any]) -> None:
+def _render_rover_panel(result: dict[str, Any], nested: bool = False) -> None:
     analysis = result.get("analysis") or {}
     st.markdown(status_badge_html(result.get("overall_status")), unsafe_allow_html=True)
     c1, c2, c3 = st.columns(3)
@@ -348,27 +382,28 @@ def _render_rover_panel(result: dict[str, Any]) -> None:
 
     segments = analysis.get("segments") or []
     if segments:
-        with st.expander(f"Per-segment detail ({len(segments)} segments)"):
-            st.dataframe(
-                [
-                    {
-                        "segment": s.get("segment_index"),
-                        "status": s.get("status"),
-                        "max_slope_deg": s.get("max_slope_deg"),
-                        "mean_tri_m": s.get("mean_tri_m"),
-                        "coverage": s.get("coverage_fraction"),
-                    }
-                    for s in segments
-                ],
-                width="stretch",
-                hide_index=True,
-            )
+        rows = [
+            {
+                "segment": s.get("segment_index"),
+                "status": s.get("status"),
+                "max_slope_deg": s.get("max_slope_deg"),
+                "mean_tri_m": s.get("mean_tri_m"),
+                "coverage": s.get("coverage_fraction"),
+            }
+            for s in segments
+        ]
+        if nested:
+            st.caption(f"Per-segment detail ({len(segments)} segments)")
+            st.dataframe(rows, width="stretch", hide_index=True)
+        else:
+            with st.expander(f"Per-segment detail ({len(segments)} segments)"):
+                st.dataframe(rows, width="stretch", hide_index=True)
     if result.get("data_source"):
         st.caption(f"Data source: {result['data_source']}")
     st.caption(analysis.get("disclaimer") or result.get("disclaimer") or "")
 
 
-def _render_landing_panel(result: dict[str, Any]) -> None:
+def _render_landing_panel(result: dict[str, Any], nested: bool = False) -> None:
     analysis = result.get("analysis") or {}
     ranked = analysis.get("ranked") or []
     unranked = analysis.get("unranked") or []
@@ -383,11 +418,19 @@ def _render_landing_panel(result: dict[str, Any]) -> None:
             f"flat radius {fmt(site.get('flat_radius_m'), ' m')} · "
             f"coverage {fmt_pct(site.get('coverage_fraction'))}"
         )
+
+    def _unranked_body() -> None:
+        for u in unranked:
+            st.markdown(status_badge_html(u.get("status")), unsafe_allow_html=True)
+            st.write(f"**{u.get('site_id')}**: {'; '.join(u.get('reasons') or [])}")
+
     if unranked:
-        with st.expander(f"Unranked sites ({len(unranked)})"):
-            for u in unranked:
-                st.markdown(status_badge_html(u.get("status")), unsafe_allow_html=True)
-                st.write(f"**{u.get('site_id')}**: {'; '.join(u.get('reasons') or [])}")
+        if nested:
+            st.caption(f"Unranked sites ({len(unranked)})")
+            _unranked_body()
+        else:
+            with st.expander(f"Unranked sites ({len(unranked)})"):
+                _unranked_body()
     st.caption(analysis.get("disclaimer") or result.get("disclaimer") or "")
 
 
@@ -468,6 +511,11 @@ def _render_dataset_panel(dataset: dict[str, Any] | None) -> None:
         st.caption(f"⚠️ {w}")
 
 
+def _pixel_size(prov: dict[str, Any]) -> Any:
+    size = prov.get("pixel_size_m")
+    return size[0] if isinstance(size, list) and size else None
+
+
 def _render_fetch_panel(result: dict[str, Any]) -> None:
     if result.get("status") != "ok":
         if result.get("status") == "no_product":
@@ -478,14 +526,14 @@ def _render_fetch_panel(result: dict[str, Any]) -> None:
             st.error(friendly_error_message(result))
         return
     origin = "from cache" if result.get("from_cache") else "downloaded from NASA"
-    st.success(f"DEM ready ({origin}): `{result.get('dem_path')}`")
     prov = result.get("provenance") or {}
+    st.success(f"DEM ready ({origin}): {prov.get('product_id') or '—'} · `{result.get('dem_path')}`")
     c1, c2 = st.columns(2)
     with c1:
         st.write(f"**Mission / instrument:** {prov.get('mission')} / {prov.get('instrument')}")
         st.write(f"**Product:** {prov.get('product_type')} ({prov.get('product_id')})")
     with c2:
-        st.write(f"**Resolution:** {fmt(prov.get('pixel_size_m', [None])[0] if isinstance(prov.get('pixel_size_m'), list) else None, ' m')}")
+        st.write(f"**Resolution:** {fmt(_pixel_size(prov), ' m')}")
         st.write(f"**Size:** {prov.get('width')} × {prov.get('height')} cells")
     if prov.get("elevation_reference"):
         st.caption(prov["elevation_reference"])
@@ -512,7 +560,7 @@ def _render_search_panel(result: dict[str, Any]) -> None:
     )
 
 
-def _render_tool_call_panel(tc: dict[str, Any]) -> None:
+def _render_tool_call_panel(tc: dict[str, Any], nested: bool = False) -> None:
     """Dispatch a chat tool-call entry to its structured panel, by tool name."""
     tool = tc.get("tool")
     result = tc.get("result")
@@ -523,9 +571,9 @@ def _render_tool_call_panel(tc: dict[str, Any]) -> None:
         st.error(friendly_error_message(result))
         return
     if tool == "evaluate_traverse_route":
-        _render_rover_panel(result)
+        _render_rover_panel(result, nested=nested)
     elif tool == "evaluate_landing_sites":
-        _render_landing_panel(result)
+        _render_landing_panel(result, nested=nested)
     elif tool == "find_safe_regions":
         _render_safe_regions_panel(result)
     elif tool in ("get_elevation_stats", "get_slope_stats", "get_roughness_stats"):
@@ -536,108 +584,238 @@ def _render_tool_call_panel(tc: dict[str, Any]) -> None:
         _render_fetch_panel(result)
     elif tool == "search_dem_products":
         _render_search_panel(result)
+    elif tool == "resolve_lunar_feature" and result.get("status") != "ok":
+        st.warning(result.get("error") or "Feature not found.")
+        known = result.get("known_features") or []
+        if known:
+            st.caption("Known features: " + ", ".join(known))
     else:
         st.markdown(f"- {tc.get('summary', tool)}")
 
 
 # ---------------------------------------------------------------------------
-# Chat + Results layout
+# Chat message rendering: answer text, activity trace, result cards, evidence
 # ---------------------------------------------------------------------------
 
-col_chat, col_results = st.columns([3, 2], gap="large")
+
+def _latest(tool_calls: list[dict[str, Any]], *tools: str) -> dict[str, Any] | None:
+    for tc in reversed(tool_calls):
+        if tc.get("tool") in tools and isinstance(tc.get("result"), dict) and tc["result"].get("status") == "ok":
+            return tc["result"]
+    return None
+
+
+def _render_result_cards(tool_calls: list[dict[str, Any]]) -> None:
+    """Compact metric cards built only from structured tool results."""
+    stats: dict[str, Any] = {}
+    resolution = None
+    for tc in tool_calls:
+        result = tc.get("result")
+        if tc.get("tool") in ("get_elevation_stats", "get_slope_stats", "get_roughness_stats") and isinstance(result, dict):
+            analysis = result.get("analysis") or {}
+            if analysis.get("terrain_available"):
+                for key in ("elevation", "slope", "roughness"):
+                    if analysis.get(key):
+                        stats[key] = analysis[key]
+                resolution = result.get("resolution_m") or resolution
+    cards: list[tuple[str, str]] = []
+    if stats.get("elevation"):
+        e = stats["elevation"]
+        cards += [("Average elevation", fmt(e.get("mean_m"), " m")), ("Min / max elevation", f"{fmt(e.get('min_m'), ' m', 0)} / {fmt(e.get('max_m'), ' m', 0)}")]
+    if stats.get("slope"):
+        s = stats["slope"]
+        cards += [("Mean slope", fmt(s.get("mean_slope_deg"), "°")), ("Max slope", fmt(s.get("max_slope_deg"), "°"))]
+    if stats.get("roughness"):
+        cards.append(("Mean roughness (TRI)", fmt(stats["roughness"].get("mean_tri_m"), " m")))
+    rover = _latest(tool_calls, "evaluate_traverse_route")
+    if rover:
+        cards.append(("Rover route status", str(rover.get("overall_status") or "—")))
+    regions = _latest(tool_calls, "find_safe_regions")
+    if regions:
+        n = len(((regions.get("analysis") or {}).get("regions")) or [])
+        cards.append(("Safe regions found", str(n)))
+    landing = _latest(tool_calls, "evaluate_landing_sites")
+    if landing:
+        cards.append(("Landing sites ranked", f"{landing.get('sites_ranked', 0)} of {landing.get('sites_evaluated', 0)}"))
+
+    fetch = _latest(tool_calls, "fetch_nasa_dem")
+    if fetch:
+        prov = fetch.get("provenance") or {}
+        cards.append(("Dataset", f"{prov.get('mission') or '—'} / {prov.get('instrument') or '—'}"))
+        cards.append(("Source", "NASA ODE / PDS"))
+    if resolution is not None:
+        cards.append(("Resolution", fmt(resolution, " m", 1)))
+
+    for start in range(0, len(cards), 3):
+        row = cards[start : start + 3]
+        cols = st.columns(3)
+        for col, (label, value) in zip(cols, row):
+            col.metric(label, value)
+
+
+def _render_evidence(tool_calls: list[dict[str, Any]]) -> None:
+    feature = _latest(tool_calls, "resolve_lunar_feature")
+    fetch = _latest(tool_calls, "fetch_nasa_dem")
+    stats_call = next(
+        (tc for tc in reversed(tool_calls) if tc.get("tool") in ("get_elevation_stats", "get_slope_stats", "get_roughness_stats")),
+        None,
+    )
+    if feature:
+        f = feature.get("feature") or {}
+        area = feature.get("analysis_area") or {}
+        st.markdown("**Coordinate region**")
+        st.write(
+            f"{f.get('name')} — centre {fmt(f.get('center_lat'), '°', 3)}, {fmt(f.get('center_lon'), '°', 3)}; "
+            f"analysis radius {fmt(area.get('radius_km'), ' km', 1)}; "
+            f"box lat {fmt(area.get('min_lat'), '°', 3)} to {fmt(area.get('max_lat'), '°', 3)}, "
+            f"lon {fmt(area.get('min_lon'), '°', 1)} to {fmt(area.get('max_lon'), '°', 1)}"
+        )
+        st.caption(f"Coordinates from: {feature.get('source')}")
+    elif stats_call and isinstance(stats_call.get("args"), dict):
+        a = stats_call["args"]
+        st.markdown("**Coordinate region**")
+        st.write(
+            f"lat {fmt(a.get('min_lat'), '°', 3)} to {fmt(a.get('max_lat'), '°', 3)}, "
+            f"lon {fmt(a.get('min_lon'), '°', 2)} to {fmt(a.get('max_lon'), '°', 2)}"
+        )
+    if fetch:
+        prov = fetch.get("provenance") or {}
+        st.markdown("**Dataset provenance**")
+        st.write(
+            f"Mission: {prov.get('mission')} · Instrument: {prov.get('instrument')} · "
+            f"Product: {prov.get('product_type')} {prov.get('product_id')}"
+        )
+        st.write(
+            f"Source: NASA ODE ({prov.get('provider') or 'nasa_ode'}) · "
+            f"Cell size: {fmt(_pixel_size(prov), ' m', 1)} · "
+            f"Raster: {prov.get('width')} × {prov.get('height')} · "
+            f"{'Served from local cache' if fetch.get('from_cache') else 'Downloaded from NASA'}"
+        )
+        if prov.get("acquired_at"):
+            st.caption(f"Acquired: {prov['acquired_at']}")
+        if prov.get("elevation_reference"):
+            st.caption(prov["elevation_reference"])
+    if stats_call:
+        st.markdown("**Processing method**")
+        st.caption(
+            "Deterministic Python (terrain_agent): windowed raster read (≤ 2048 × 2048 cells), "
+            "elevation statistics over valid cells, Horn's-method slope, TRI roughness. "
+            "The language model performed no terrain calculation."
+        )
+    for tc in tool_calls:
+        if tc.get("tool") in ("resolve_lunar_feature",) and (tc.get("result") or {}).get("status") == "ok":
+            continue
+        st.markdown(f"**{TOOL_LABELS.get(tc.get('tool'), tc.get('tool'))}**")
+        _render_tool_call_panel(tc, nested=True)
+
+
+def _render_assistant_message(msg: dict[str, Any]) -> None:
+    status = msg.get("status")
+    tool_calls = msg.get("tool_calls") or []
+    if msg.get("is_demo"):
+        st.info("📡 Demo Mode — set GEMINI_API_KEY for live AI analysis, or use the Direct "
+                "Analysis tools below, which work without one.")
+    if status in ("invalid_request", "rate_limited", "model_error"):
+        st.warning(msg.get("content", ""))
+    else:
+        st.markdown(sanitize_model_markdown(msg.get("content", "")))
+    if tool_calls:
+        _render_result_cards(tool_calls)
+        outcome = analysis_outcome(status, tool_calls)
+        st.caption(f"Analysis status: {outcome}")
+        with st.expander("Analysis trace"):
+            for step in build_trace(tool_calls):
+                st.caption(f"{'✓' if step['ok'] else '⚠'} {step['label']} — {step['detail']}")
+        with st.expander("Evidence & details"):
+            _render_evidence(tool_calls)
+
+
+def _history_for_agent() -> list[dict[str, Any]]:
+    return [
+        {"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]}
+        for m in st.session_state.messages
+        if m.get("content") and m.get("status") not in ("invalid_request", "rate_limited", "model_error")
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Conversation
+# ---------------------------------------------------------------------------
 
 SUGGESTED = [
     "What is the average elevation around Shackleton Crater?",
-    "Find regions near Shackleton with slope below 12°",
-    "What DEM data is available for the lunar south pole?",
-    "Is a traverse from -89.9°, 0° to -89.5°, 0° safe?",
-    "Compare three candidate landing sites near Shackleton",
+    "Check rover safety for a terrain region near Shackleton Crater.",
     "What is the terrain roughness around Haworth Crater?",
+    "What DEM data is available for the lunar south pole?",
 ]
 
-with col_chat:
-    st.markdown("### 💬 Ask a Terrain Question")
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"], avatar="🧑‍🚀" if msg["role"] == "user" else "🌕"):
+        if msg["role"] == "user":
+            st.text(msg["content"])
+        else:
+            _render_assistant_message(msg)
 
-    pill_cols = st.columns(3)
+if not st.session_state.messages:
+    st.caption("Try one of these, or ask your own terrain question:")
+    pill_cols = st.columns(2)
     for idx, q in enumerate(SUGGESTED):
-        if pill_cols[idx % 3].button(
-            q[:40] + ("…" if len(q) > 40 else ""), key=f"pill_{idx}", width="stretch", help=q,
-        ):
+        if pill_cols[idx % 2].button(q, key=f"pill_{idx}", width="stretch"):
             st.session_state["_pending_query"] = q
 
-    chat_container = st.container(height=400, border=False)
-    with chat_container:
-        for msg in st.session_state.messages:
-            css = "user-bubble" if msg["role"] == "user" else "assistant-bubble"
-            icon = "👤" if msg["role"] == "user" else "🌕"
-            # Escaped: this is the user's own message, or the assistant's text, which can in
-            # turn echo external data (e.g. a NASA product description) the model saw. Neither
-            # is trusted HTML -- rendering it unescaped would let injected markup/script run
-            # in the browser (Phase 8 hardening).
-            safe_content = html.escape(str(msg["content"]))
-            st.markdown(f'<div class="{css}">{icon} {safe_content}</div>', unsafe_allow_html=True)
+# Inside a container the chat input renders inline, right under the conversation, instead of
+# being pinned over the Direct Analysis section below it.
+with st.container():
+    typed = st.chat_input("Ask TALUS about lunar terrain, e.g. elevation around Shackleton Crater")
+query = (typed or st.session_state.pop("_pending_query", "") or "").strip()
 
-    with st.form("chat_form", clear_on_submit=True):
-        pending = st.session_state.pop("_pending_query", "")
-        user_input = st.text_input(
-            "Your question", value=pending,
-            placeholder="e.g. What is the slope near Shackleton Crater?",
-            label_visibility="collapsed",
-        )
-        submit = st.form_submit_button("Send →", width="stretch")
+if query:
+    history = _history_for_agent()
+    st.session_state.messages.append({"role": "user", "content": query})
+    with st.chat_message("user", avatar="🧑‍🚀"):
+        st.text(query)
+    with st.chat_message("assistant", avatar="🌕"):
+        with st.status("Analyzing your request…", expanded=True) as activity:
+            def _on_event(kind: str, info: dict[str, Any]) -> None:
+                if kind == "model" and info.get("phase") == "interpreting":
+                    activity.write("⏳ Interpreting terrain request")
+                elif kind == "tool_start":
+                    activity.write(f"⏳ {TOOL_LABELS.get(info.get('tool'), 'Running terrain tool')}…")
+                elif kind == "tool_end":
+                    mark = "✓" if info.get("status") in ("ok",) else "⚠"
+                    activity.write(f"{mark} {info.get('summary', '')}")
 
-    if submit and user_input.strip():
-        query = user_input.strip()
-        st.session_state.messages.append({"role": "user", "content": query})
-        history = [
-            {"role": m["role"], "parts": [{"text": m["content"]}]}
-            for m in st.session_state.messages[:-1]
-        ]
-        with st.spinner("Analysing terrain…"):
             if agent is not None:
-                result = agent.chat(query, history=history, max_slope_deg=max_slope)
+                result = agent.chat(query, history=history, max_slope_deg=max_slope, on_event=_on_event)
             else:
                 result = {
-                    "text": "TALUS agent could not be initialised. Please check the server logs.",
+                    "status": "model_error",
+                    "text": "The TALUS agent could not be initialised. Please check the server logs.",
                     "tool_calls": [], "is_demo": True,
                 }
-        st.session_state.messages.append({"role": "assistant", "content": result["text"]})
-        st.session_state.tool_calls = result.get("tool_calls", [])
-        st.session_state.last_result = result
-        st.rerun()
-
-
-with col_results:
-    st.markdown("### 📊 Analysis Results")
-    last = st.session_state.last_result
-
-    if last is None:
-        st.markdown(
-            "<div style='text-align:center; color:#475569; padding:60px 20px;'>"
-            "<div style='font-size:3rem;'>🌑</div>"
-            "<div style='margin-top:12px; font-size:0.95rem;'>Ask a terrain question to see results here.</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-    else:
-        if last.get("is_demo"):
-            st.info("📡 Demo Mode — set GEMINI_API_KEY for live AI analysis, or use the Direct "
-                     "Analysis tools below, which work without one.")
-        if last.get("status") in ("invalid_request", "rate_limited", "model_error"):
-            st.warning(last.get("text", ""))
-        else:
-            tool_calls = st.session_state.tool_calls
-            if tool_calls:
-                st.markdown("#### Tools executed")
-                for tc in tool_calls:
-                    icon = "✅" if tc.get("result_status") in ("ok",) else "⚠️"
-                    st.caption(f"{icon} `{tc.get('tool')}` — {tc.get('summary', '')}")
-                st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-                for tc in tool_calls:
-                    with st.expander(f"🔧 {tc.get('tool')}", expanded=True):
-                        _render_tool_call_panel(tc)
-            st.markdown("#### Response")
-            st.markdown(last.get("text", ""))
+            failed = result.get("status") in ("invalid_request", "rate_limited", "model_error")
+            activity.update(
+                label="Analysis could not be completed" if failed else "Analysis complete",
+                state="error" if failed else "complete",
+                expanded=False,
+            )
+    tool_calls = result.get("tool_calls") or []
+    st.session_state.messages.append(
+        {
+            "role": "assistant",
+            "content": result.get("text", ""),
+            "status": result.get("status"),
+            "is_demo": result.get("is_demo", False),
+            "tool_calls": tool_calls,
+        }
+    )
+    st.session_state.messages = st.session_state.messages[-MAX_STORED_MESSAGES:]
+    new_nasa = nasa_status_from_tool_calls(tool_calls)
+    if new_nasa:
+        st.session_state.nasa_status = new_nasa
+    if _latest(tool_calls, "fetch_nasa_dem"):
+        _cached_managed_dems.clear()
+    st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -647,14 +825,14 @@ with col_results:
 # ---------------------------------------------------------------------------
 
 st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-st.markdown("## 🧪 Direct Structured Analysis")
+st.markdown("### 🧪 Direct Structured Analysis")
 st.caption(
     "Run a deterministic terrain tool directly with structured coordinates and thresholds — "
     "no natural-language interpretation, no model required."
 )
 
 tab_dataset, tab_stats, tab_regions, tab_rover, tab_landing, tab_search = st.tabs(
-    ["📄 Dataset Info", "📈 Terrain Statistics", "🟢 Safe Regions", "🚗 Rover Route", "🛬 Landing Sites", "🔎 NASA DEM Search"]
+    ["📄 Dataset", "📈 Statistics", "🟢 Safe Regions", "🚗 Rover Route", "🛬 Landing", "🔎 NASA DEM"]
 )
 
 _DEM_HELP = "Only DEMs already present in the managed cache/sample directories are offered."
@@ -662,7 +840,7 @@ _DEM_HELP = "Only DEMs already present in the managed cache/sample directories a
 
 def _dem_selector(key: str) -> str | None:
     if not available_dems:
-        st.info("No DEMs cached yet — fetch one from the NASA DEM Search tab first.")
+        st.info("No DEMs cached yet — fetch one from the NASA DEM tab first.")
         return None
     index = available_dems.index(default_dem) if default_dem in available_dems else 0
     return st.selectbox("DEM file", options=available_dems, index=index, help=_DEM_HELP, key=key)
@@ -844,6 +1022,9 @@ with tab_search:
         with st.spinner("Contacting NASA ODE / PDS (only official NASA hosts are ever contacted)…"):
             result = _dispatch("fetch_nasa_dem", {"lat": f_lat, "lon": f_lon, "radius_km": f_radius})
         _render_fetch_panel(result)
+        new_nasa = nasa_status_from_tool_calls([{"tool": "fetch_nasa_dem", "result": result}])
+        if new_nasa:
+            st.session_state.nasa_status = new_nasa
         if result.get("status") == "ok":
             _cached_managed_dems.clear()
 
@@ -853,10 +1034,7 @@ with tab_search:
 # ---------------------------------------------------------------------------
 
 st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-st.markdown(
-    f"<div style='text-align:center; color:#475569; font-size:0.75rem; padding:8px 0;'>"
-    f"TALUS v{_APP_VERSION} · Research &amp; Demo System · "
-    "All terrain values originate from deterministic NASA DEM data only · "
-    "NOT certified for flight operations</div>",
-    unsafe_allow_html=True,
+st.caption(
+    f"TALUS v{_APP_VERSION} · Research & Demo System · All terrain values originate from "
+    "deterministic NASA DEM processing · NOT certified for flight operations"
 )

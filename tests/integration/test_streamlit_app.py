@@ -426,7 +426,7 @@ class _FakeAgent:
         self._tool_calls = tool_calls or []
         self._is_demo = is_demo
 
-    def chat(self, user_message, history=None, max_slope_deg=15.0):
+    def chat(self, user_message, history=None, max_slope_deg=15.0, on_event=None):
         return {"status": "ok", "text": self._text, "tool_calls": self._tool_calls, "is_demo": self._is_demo}
 
 
@@ -440,10 +440,7 @@ def test_chat_round_trip_with_a_mocked_agent(app, monkeypatch):
     monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: fake)
 
     app.run()
-    text_input = at_input = next(w for w in app.text_input if w.label == "Your question")
-    text_input.set_value("what is the slope near the south pole?")
-    submit = next(b for b in app.button if "Send" in b.label)
-    submit.click().run()
+    app.chat_input[0].set_value("what is the slope near the south pole?").run()
 
     assert not app.exception
     assert any("mean slope is 8 degrees" in getattr(m, "value", "") for m in app.markdown)
@@ -451,8 +448,8 @@ def test_chat_round_trip_with_a_mocked_agent(app, monkeypatch):
 
 
 def test_chat_message_content_is_html_escaped_not_rendered_as_markup(app, monkeypatch):
-    """Phase 8 hardening: chat bubbles render the user's own message and the assistant's text
-    with unsafe_allow_html=True for styling; both must be HTML-escaped first, since the
+    """Phase 8 hardening: the user's own message and the assistant's text must never be
+    rendered as live HTML; both must stay inert text, since the
     assistant's text can in turn echo external data (e.g. a NASA product description) the
     model saw -- neither is trusted HTML."""
     import terrain_agent.agent as agent_pkg
@@ -462,19 +459,15 @@ def test_chat_message_content_is_html_escaped_not_rendered_as_markup(app, monkey
     monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: fake)
 
     app.run()
-    text_input = next(w for w in app.text_input if w.label == "Your question")
-    text_input.set_value(payload)
-    submit = next(b for b in app.button if "Send" in b.label)
-    submit.click().run()
+    app.chat_input[0].set_value(payload).run()
 
     assert not app.exception
-    # Only the chat-bubble markup is rendered with unsafe_allow_html=True; that specific
-    # element must contain the escaped form, not the live tag, regardless of what the
-    # separate (non-HTML) "Response" text block below it shows as plain text.
-    bubbles = [m.value for m in app.markdown if 'class="user-bubble"' in getattr(m, "value", "") or 'class="assistant-bubble"' in getattr(m, "value", "")]
-    assert bubbles
-    assert all("<img src=x onerror=alert(1)>" not in b for b in bubbles)
-    assert all("&lt;img" in b for b in bubbles)
+    # Chat content is rendered with st.chat_message + st.text / st.markdown, never with
+    # unsafe_allow_html. The payload must still be shown (as inert text), and no element that
+    # is allowed to render raw HTML may contain the live tag.
+    assert all(payload not in m.value for m in app.markdown if m.proto.allow_html)
+    shown = [t.value for t in app.text] + [m.value for m in app.markdown if not m.proto.allow_html]
+    assert any(payload in s for s in shown)
 
 
 def test_chat_demo_mode_banner_shown_when_no_live_model(app, monkeypatch):
@@ -485,10 +478,7 @@ def test_chat_demo_mode_banner_shown_when_no_live_model(app, monkeypatch):
     monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: fake)
 
     app.run()
-    text_input = next(w for w in app.text_input if w.label == "Your question")
-    text_input.set_value("hello")
-    submit = next(b for b in app.button if "Send" in b.label)
-    submit.click().run()
+    app.chat_input[0].set_value("hello").run()
 
     assert not app.exception
     assert any("Demo Mode" in getattr(i, "value", "") for i in app.info)
@@ -502,16 +492,13 @@ def test_chat_rejects_are_shown_as_a_warning_not_a_crash(app, monkeypatch):
     class _RejectingAgent:
         is_live = True
 
-        def chat(self, user_message, history=None, max_slope_deg=15.0):
+        def chat(self, user_message, history=None, max_slope_deg=15.0, on_event=None):
             return {"status": "rate_limited", "text": "Too many requests. Please wait a moment and try again.", "tool_calls": [], "is_demo": False}
 
     monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: _RejectingAgent())
 
     app.run()
-    text_input = next(w for w in app.text_input if w.label == "Your question")
-    text_input.set_value("go go go")
-    submit = next(b for b in app.button if "Send" in b.label)
-    submit.click().run()
+    app.chat_input[0].set_value("go go go").run()
 
     assert not app.exception
     assert any("Too many requests" in getattr(w, "value", "") for w in app.warning)
@@ -639,3 +626,122 @@ def test_dem_fetch_tab_reports_no_product_found_not_a_crash(app, monkeypatch):
 
     assert not app.exception
     assert any("no nasa dem product" in getattr(w, "value", "").lower() for w in app.warning)
+
+
+# ---------------------------------------------------------------------------
+# Release audit: Shackleton result cards, NASA status, history roles, no duplicate calls
+# ---------------------------------------------------------------------------
+
+
+def _shackleton_tool_calls() -> list[dict[str, Any]]:
+    fetch = {
+        "status": "ok", "tool": "fetch_nasa_dem", "dem_path": "nasa/ldem_75s_240m-6d162ce24928.tif", "from_cache": False,
+        "provenance": {
+            "provider": "nasa_ode", "mission": "LRO", "instrument": "LOLA", "product_type": "GDRDEM",
+            "product_id": "ldem_75s_240m", "pixel_size_m": [240.0, 240.0], "width": 3812, "height": 3812,
+            "acquired_at": "2026-09-30T00:08:19Z",
+            "elevation_reference": "Height above a sphere of radius 1737400 m, not a geoid.",
+        },
+    }
+    elevation = {
+        "status": "ok", "tool": "get_elevation_stats", "resolution_m": 239.999,
+        "analysis": {
+            "terrain_available": True, "coverage_fraction": 1.0, "resolution_m": 239.999,
+            "elevation": {"mean_m": -185.54, "min_m": -2855.5, "max_m": 1954.5},
+        },
+    }
+    feature = {
+        "status": "ok", "tool": "resolve_lunar_feature", "source": "TALUS curated lunar feature gazetteer",
+        "feature": {"name": "Shackleton Crater", "center_lat": -89.9, "center_lon": 0.0},
+        "analysis_area": {"min_lat": -90.0, "max_lat": -89.55, "min_lon": -180.0, "max_lon": 180.0, "radius_km": 10.5},
+    }
+    return [
+        {"tool": "resolve_lunar_feature", "result_status": "ok", "summary": "Resolved Shackleton Crater from the TALUS gazetteer.", "args": {"name": "Shackleton Crater"}, "result": feature},
+        {"tool": "fetch_nasa_dem", "result_status": "ok", "summary": "Selected a NASA DEM covering the requested region.", "args": {"lat": -89.9, "lon": 0.0}, "result": fetch},
+        {"tool": "get_elevation_stats", "result_status": "ok", "summary": "Calculated elevation statistics for the requested area.", "args": {"dem_path": "x", "min_lat": -90.0, "max_lat": -89.55, "min_lon": -180.0, "max_lon": 180.0}, "result": elevation},
+    ]
+
+
+class _RecordingAgent(_FakeAgent):
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.calls: list[dict[str, Any]] = []
+
+    def chat(self, user_message, history=None, max_slope_deg=15.0, on_event=None):
+        self.calls.append({"message": user_message, "history": history})
+        if on_event:
+            on_event("tool_start", {"tool": "fetch_nasa_dem"})
+            on_event("tool_end", {"tool": "fetch_nasa_dem", "status": "ok", "summary": "done"})
+        return super().chat(user_message, history, max_slope_deg)
+
+
+def test_shackleton_answer_renders_result_cards_evidence_and_nasa_status(app, monkeypatch):
+    import terrain_agent.agent as agent_pkg
+
+    fake = _RecordingAgent("Based on the retrieved LOLA DEM, the mean elevation is -185.54 m. Research/demo, not certified.", tool_calls=_shackleton_tool_calls())
+    monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: fake)
+
+    app.run()
+    assert any("Not yet contacted" in m.value or "Downloads disabled" in m.value for m in app.markdown)
+    app.chat_input[0].set_value("What is the average elevation around Shackleton Crater?").run()
+
+    assert not app.exception
+    metrics = {m.label: m.value for m in app.metric}
+    assert metrics["Average elevation"] == "-185.54 m"
+    assert metrics["Dataset"] == "LRO / LOLA"
+    assert metrics["Source"] == "NASA ODE / PDS"
+    captions = " ".join(c.value for c in app.caption)
+    assert "Analysis status: Completed" in captions
+    assert "Resolving lunar coordinates" in captions and "Calculating elevation" in captions
+    assert any("ldem_75s_240m" in m.value for m in app.markdown)
+    assert any("NASA ODE" in m.value and "Connected" in m.value for m in app.markdown)
+
+
+def test_follow_up_history_uses_gemini_roles_and_reruns_do_not_repeat_calls(app, monkeypatch):
+    import terrain_agent.agent as agent_pkg
+
+    fake = _RecordingAgent("Answer. Research/demo, not certified.")
+    monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: fake)
+
+    app.run()
+    app.chat_input[0].set_value("first question").run()
+    app.run()  # a plain rerun (e.g. a widget change) must not call the agent again
+    assert len(fake.calls) == 1
+    app.chat_input[0].set_value("second question").run()
+
+    assert not app.exception
+    assert len(fake.calls) == 2
+    history = fake.calls[1]["history"]
+    assert [h["role"] for h in history] == ["user", "model"]
+    assert history[0]["parts"][0]["text"] == "first question"
+
+
+def test_suggested_prompt_button_runs_the_query_once(app, monkeypatch):
+    import terrain_agent.agent as agent_pkg
+
+    fake = _RecordingAgent("Answer. Research/demo, not certified.")
+    monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: fake)
+
+    app.run()
+    next(b for b in app.button if "Shackleton" in b.label).click().run()
+
+    assert not app.exception
+    assert [c["message"] for c in fake.calls] == ["What is the average elevation around Shackleton Crater?"]
+
+
+def test_model_error_keeps_deterministic_results_visible(app, monkeypatch):
+    import terrain_agent.agent as agent_pkg
+
+    class _Failing(_FakeAgent):
+        def chat(self, user_message, history=None, max_slope_deg=15.0, on_event=None):
+            return {"status": "model_error", "text": "Gemini service is currently unavailable. Please retry the analysis.", "tool_calls": _shackleton_tool_calls()[:2], "is_demo": False}
+
+    monkeypatch.setattr(agent_pkg, "TALUSAgent", lambda *a, **k: _Failing(""))
+
+    app.run()
+    app.chat_input[0].set_value("elevation around Shackleton?").run()
+
+    assert not app.exception
+    assert any("Gemini service is currently unavailable" in w.value for w in app.warning)
+    assert any("Analysis status: Not completed" in c.value for c in app.caption)
+    assert {m.label for m in app.metric} >= {"Dataset", "Source"}

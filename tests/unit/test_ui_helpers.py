@@ -170,3 +170,69 @@ def test_build_terrain_map_figure_includes_safe_region_markers():
     regions = [{"region_id": "r0", "centroid_lat": -89.9, "centroid_lon": 0.0, "largest_inscribed_circle_radius_m": 400.0}]
     fig = build_terrain_map_figure(safe_regions=regions)
     assert any(t.name == "r0" for t in fig.data)
+
+
+# ---------------------------------------------------------------------------
+# Release audit: activity trace, outcome, NASA status, markdown sanitising, NASA errors
+# ---------------------------------------------------------------------------
+
+import ui_helpers as _uh  # noqa: E402
+
+
+def _tc(tool, status, **result):
+    return {"tool": tool, "result_status": status, "summary": f"{tool} {status}", "result": {"status": status, **result}}
+
+
+def test_trace_lists_only_observable_steps_in_order():
+    steps = _uh.build_trace([_tc("resolve_lunar_feature", "ok"), _tc("fetch_nasa_dem", "error")])
+    assert [s["label"] for s in steps] == [
+        "Interpreting terrain request",
+        "Resolving lunar coordinates",
+        _uh.TOOL_LABELS["fetch_nasa_dem"],
+        "Preparing evidence",
+    ]
+    assert [s["ok"] for s in steps] == [True, True, False, True]
+
+
+@pytest.mark.parametrize(
+    "status, calls, expected",
+    [
+        ("ok", [_tc("get_elevation_stats", "ok")], "Completed"),
+        ("ok", [_tc("fetch_nasa_dem", "ok"), _tc("get_elevation_stats", "error")], "Partially completed"),
+        ("ok", [_tc("fetch_nasa_dem", "no_product")], "Not completed"),
+        ("model_error", [_tc("fetch_nasa_dem", "ok")], "Not completed"),
+        ("ok", [], "Not completed"),
+    ],
+)
+def test_analysis_outcome(status, calls, expected):
+    assert _uh.analysis_outcome(status, calls) == expected
+
+
+def test_nasa_status_tracks_real_contact_only():
+    assert _uh.nasa_status_from_tool_calls([]) is None
+    assert _uh.nasa_status_from_tool_calls([_tc("fetch_nasa_dem", "ok", from_cache=True)]) is None
+    assert _uh.nasa_status_from_tool_calls([_tc("fetch_nasa_dem", "ok", from_cache=False)]) == "connected"
+    assert _uh.nasa_status_from_tool_calls([_tc("search_dem_products", "no_products_found")]) == "connected"
+    assert _uh.nasa_status_from_tool_calls([_tc("fetch_nasa_dem", "disabled")]) == "disabled"
+    err = _tc("fetch_nasa_dem", "error", error_type="ProviderUnavailableError")
+    assert _uh.nasa_status_from_tool_calls([err]) == "error"
+    assert _uh.nasa_status_from_tool_calls([_tc("get_elevation_stats", "error", error_type="ProviderUnavailableError")]) is None
+
+
+def test_model_markdown_cannot_load_remote_images():
+    text = "See ![tracker](https://evil.example.com/p.png) and **bold**."
+    assert _uh.sanitize_model_markdown(text) == "See tracker and **bold**."
+    assert _uh.sanitize_model_markdown(None) == ""
+
+
+@pytest.mark.parametrize(
+    "error_type, expected",
+    [
+        ("ProviderUnavailableError", "NASA ODE could not be reached. The terrain analysis cannot continue without terrain data."),
+        ("NoCoverageError", "No suitable lunar DEM was found for this location."),
+        ("DemValidationError", "The downloaded terrain product could not be opened as a valid raster."),
+        ("InternalError", "The terrain tool could not complete this operation."),
+    ],
+)
+def test_nasa_and_tool_failures_have_plain_messages(error_type, expected):
+    assert friendly_error_message({"status": "error", "error_type": error_type}) == expected

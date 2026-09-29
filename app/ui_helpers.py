@@ -9,6 +9,7 @@ produced by the deterministic ``terrain_agent`` tools (see ``terrain_agent.agent
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -54,7 +55,23 @@ _ERROR_PREFIXES: dict[str, str] = {
     "TerrainAnalysisError": "The requested DEM file could not be used.",
     "MissingArgument": "A required field is missing.",
     "InvalidArgument": "One of the values you entered is not valid.",
-    "InternalError": "Something went wrong while analysing the terrain.",
+    "InternalError": "The terrain tool could not complete this operation.",
+    "UnknownTool": "The terrain tool could not complete this operation.",
+    # NASA acquisition failures (terrain_agent.acquisition.errors)
+    "ProviderUnavailableError": (
+        "NASA ODE could not be reached. The terrain analysis cannot continue without terrain data."
+    ),
+    "ProviderResponseError": "NASA ODE returned a response TALUS could not interpret.",
+    "NoCoverageError": "No suitable lunar DEM was found for this location.",
+    "NoSuitableProductError": "No suitable lunar DEM was found for this location.",
+    "DownloadError": "The NASA terrain product could not be downloaded.",
+    "HostPolicyError": "The NASA terrain product could not be downloaded.",
+    "DownloadTooLargeError": "The NASA terrain product is larger than this deployment's download limit.",
+    "DownloadIncompleteError": "The NASA terrain product could not be downloaded completely.",
+    "DownloadTimeoutError": "The NASA terrain product download timed out.",
+    "DownloadChecksumError": "The downloaded terrain product failed its integrity check.",
+    "DemValidationError": "The downloaded terrain product could not be opened as a valid raster.",
+    "CacheError": "The downloaded terrain product could not be stored in the local cache.",
 }
 _DEFAULT_ERROR_PREFIX = "The analysis could not be completed."
 
@@ -70,6 +87,90 @@ def friendly_error_message(result: dict[str, Any]) -> str:
         return detail or "Too many requests in a short period. Please wait a moment and try again."
     prefix = _ERROR_PREFIXES.get(result.get("error_type") or "", _DEFAULT_ERROR_PREFIX)
     return f"{prefix} {detail}".strip() if detail else prefix
+
+
+# ---------------------------------------------------------------------------
+# Agent activity trace
+#
+# Observable actions only: each line is derived from a tool name and its structured result
+# status / deterministic summary -- never from model reasoning or model prose.
+# ---------------------------------------------------------------------------
+
+TOOL_LABELS: dict[str, str] = {
+    "resolve_lunar_feature": "Resolving lunar coordinates",
+    "search_dem_products": "Searching NASA ODE",
+    "fetch_nasa_dem": "Searching NASA ODE and loading the LOLA DEM (a first download can take several minutes)",
+    "get_elevation_stats": "Calculating elevation",
+    "get_slope_stats": "Calculating slope",
+    "get_roughness_stats": "Calculating roughness",
+    "evaluate_traverse_route": "Evaluating rover route safety",
+    "evaluate_landing_sites": "Evaluating landing sites",
+    "find_safe_regions": "Finding safe regions",
+    "dataset_information": "Reading dataset provenance",
+}
+
+_OK_STATUSES = frozenset({"ok"})
+
+
+def build_trace(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ordered ``{"label", "detail", "ok"}`` steps for a finished agent turn."""
+    steps = [{"label": "Interpreting terrain request", "detail": "Request understood.", "ok": True}]
+    for tc in tool_calls:
+        tool = tc.get("tool")
+        status = tc.get("result_status") or (tc.get("result") or {}).get("status")
+        steps.append(
+            {
+                "label": TOOL_LABELS.get(tool, str(tool)),
+                "detail": str(tc.get("summary") or ""),
+                "ok": status in _OK_STATUSES,
+            }
+        )
+    steps.append({"label": "Preparing evidence", "detail": "Results and provenance attached.", "ok": True})
+    return steps
+
+
+def analysis_outcome(status: str | None, tool_calls: list[dict[str, Any]]) -> str:
+    """Completed / Partially completed / Not completed, from structured statuses only."""
+    if status not in ("ok", None) or not tool_calls:
+        return "Not completed"
+    statuses = [tc.get("result_status") or (tc.get("result") or {}).get("status") for tc in tool_calls]
+    if all(s in _OK_STATUSES for s in statuses):
+        return "Completed"
+    if any(s in _OK_STATUSES for s in statuses):
+        return "Partially completed"
+    return "Not completed"
+
+
+def nasa_status_from_tool_calls(tool_calls: list[dict[str, Any]]) -> str | None:
+    """Latest observed NASA ODE state from network-tool results, or ``None`` if NASA was not
+    contacted (a cache hit says nothing about whether NASA is reachable right now)."""
+    state: str | None = None
+    for tc in tool_calls:
+        if tc.get("tool") not in ("search_dem_products", "fetch_nasa_dem"):
+            continue
+        result = tc.get("result") or {}
+        status = result.get("status")
+        if status == "disabled":
+            state = "disabled"
+        elif status in ("ok", "no_product", "no_products_found"):
+            if not result.get("from_cache"):
+                state = "connected"
+        elif status == "error" and result.get("error_type") in ("ProviderUnavailableError", "ProviderResponseError"):
+            state = "error"
+    return state
+
+
+_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+
+
+def sanitize_model_markdown(text: str) -> str:
+    """Render model text as Markdown without letting it load remote images.
+
+    Streamlit's Markdown never renders raw HTML (it is escaped), but ``![alt](url)`` would make
+    the viewer's browser fetch an arbitrary URL -- model text can echo external data, so image
+    syntax is reduced to its alt text.
+    """
+    return _MD_IMAGE_RE.sub(r"\1", str(text or ""))
 
 
 # ---------------------------------------------------------------------------
